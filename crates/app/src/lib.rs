@@ -43,24 +43,20 @@ impl ApplicationHandler for App {
             use wasm_bindgen::JsCast;
             use winit::platform::web::WindowAttributesExtWebSys;
 
-            let web_window = web_sys::window().expect("no window");
-            let document = web_window.document().expect("no document");
-            let canvas = document
+            let canvas = web_sys::window()
+                .expect("no window")
+                .document()
+                .expect("no document")
                 .get_element_by_id("canvas")
                 .expect("no #canvas element")
                 .dyn_into::<web_sys::HtmlCanvasElement>()
                 .expect("#canvas is not a canvas");
 
-            // Size the canvas to fill the viewport in physical pixels.
-            let w = web_window.inner_width().unwrap().as_f64().unwrap() as u32;
-            let h = web_window.inner_height().unwrap().as_f64().unwrap() as u32;
-            canvas.set_width(w);
-            canvas.set_height(h);
-
+            // Let CSS (100vw × 100vh !important) control the display size.
+            // winit fires a Resized event that drives the wgpu surface config.
             Window::default_attributes()
                 .with_title("Webtych")
                 .with_canvas(Some(canvas))
-                .with_inner_size(winit::dpi::PhysicalSize::new(w, h))
         };
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
