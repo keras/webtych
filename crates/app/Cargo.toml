@@ -1,0 +1,34 @@
+[package]
+name = "webtych"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "webtych-desktop"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "29"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "29", features = ["webgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+] }
+console_error_panic_hook = "0.1"
+console_log = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+env_logger = "0.11"

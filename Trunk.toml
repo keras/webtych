@@ -1,0 +1,6 @@
+[build]
+target = "crates/app/index.html"
+dist = "dist"
+
+[watch]
+watch = ["crates"]
