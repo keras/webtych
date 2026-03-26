@@ -62,7 +62,7 @@ impl Renderer {
         let width  = size.width.max(1);
         let height = size.height.max(1);
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
@@ -162,13 +162,13 @@ impl Renderer {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module:               &shader,
-                entry_point:          Some("vs_main"),
+                entry_point:          "vs_main",
                 buffers:              &[],
                 compilation_options:  Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module:              &shader,
-                entry_point:         Some("fs_main"),
+                entry_point:         "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend:      Some(wgpu::BlendState::REPLACE),
