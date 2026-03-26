@@ -20,8 +20,7 @@ struct VOut {
 fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     const PI2: f32 = 6.2831853;
     let base_angle = f32(vi) * (PI2 / 3.0) + PI2 / 4.0;
-    let t = u.time;
-    let angle = base_angle + t;
+    let angle = base_angle + u.time;
     let r = 0.55;
     let pos = vec2<f32>(cos(angle) * r, sin(angle) * r);
 
@@ -43,28 +42,41 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+// ── Error type ────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum RenderError {
+    /// Surface is lost or outdated — caller should call resize().
+    Reconfigure,
+    /// Unrecoverable error — caller should exit.
+    Fatal,
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    surface:         wgpu::Surface<'static>,
-    device:          wgpu::Device,
-    queue:           wgpu::Queue,
-    config:          wgpu::SurfaceConfiguration,
-    pipeline:        wgpu::RenderPipeline,
-    uniform_buf:     wgpu::Buffer,
-    bind_group:      wgpu::BindGroup,
-    frame:           u64,
+    surface:     wgpu::Surface<'static>,
+    device:      wgpu::Device,
+    queue:       wgpu::Queue,
+    config:      wgpu::SurfaceConfiguration,
+    pipeline:    wgpu::RenderPipeline,
+    uniform_buf: wgpu::Buffer,
+    bind_group:  wgpu::BindGroup,
+    frame:       u64,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
+        let size   = window.inner_size();
         let width  = size.width.max(1);
         let height = size.height.max(1);
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
+            backends:                 wgpu::Backends::all(),
+            flags:                    wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options:          wgpu::BackendOptions::default(),
+            display:                  None,
         });
 
         let surface = instance.create_surface(window).expect("create surface");
@@ -78,19 +90,18 @@ impl Renderer {
             .await
             .expect(
                 "No WebGPU adapter found. \
-                 Please use Chrome 113+ or another WebGPU-capable browser.",
+                 Please use Chrome 113+, Edge 113+, or Safari 18+.",
             );
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label:             None,
-                    required_features: wgpu::Features::empty(),
-                    required_limits:   wgpu::Limits::default(),
-                    memory_hints:      wgpu::MemoryHints::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label:                 None,
+                required_features:     wgpu::Features::empty(),
+                required_limits:       wgpu::Limits::default(),
+                experimental_features: Default::default(),
+                memory_hints:          wgpu::MemoryHints::default(),
+                trace:                 Default::default(),
+            })
             .await
             .expect("request device");
 
@@ -104,13 +115,13 @@ impl Renderer {
             .unwrap_or(caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
-            usage:                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
-            present_mode:                 wgpu::PresentMode::AutoVsync,
-            alpha_mode:                   caps.alpha_modes[0],
-            view_formats:                 vec![],
+            present_mode:                  wgpu::PresentMode::AutoVsync,
+            alpha_mode:                    caps.alpha_modes[0],
+            view_formats:                  vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
@@ -152,23 +163,23 @@ impl Renderer {
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:                Some("layout"),
-            bind_group_layouts:   &[&bgl],
-            push_constant_ranges: &[],
+            label:              Some("layout"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size:     0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label:  Some("pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
-                module:               &shader,
-                entry_point:          "vs_main",
-                buffers:              &[],
-                compilation_options:  Default::default(),
+                module:              &shader,
+                entry_point:         Some("vs_main"),
+                buffers:             &[],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module:              &shader,
-                entry_point:         "fs_main",
+                entry_point:         Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend:      Some(wgpu::BlendState::REPLACE),
@@ -180,10 +191,10 @@ impl Renderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample:   wgpu::MultisampleState::default(),
-            multiview:     None,
-            cache:         None,
+            depth_stencil:  None,
+            multisample:    wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache:          None,
         });
 
         Self {
@@ -208,14 +219,20 @@ impl Renderer {
 
     pub fn update(&mut self) {
         self.frame += 1;
-        // ~60 fps assumed; gives one full revolution per ~6 seconds.
         let time: f32 = self.frame as f32 / 60.0;
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&time));
     }
 
-    pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view   = output
+    pub fn render(&self) -> Result<(), RenderError> {
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::Reconfigure),
+            _ => return Err(RenderError::Fatal),
+        };
+
+        let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -229,6 +246,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &view,
                     resolve_target: None,
+                    depth_slice:    None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.04,
@@ -242,6 +260,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 occlusion_query_set:      None,
                 timestamp_writes:         None,
+                multiview_mask:           None,
             });
 
             pass.set_pipeline(&self.pipeline);

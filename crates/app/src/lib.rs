@@ -117,14 +117,13 @@ impl ApplicationHandler for App {
                 renderer.update();
                 match renderer.render() {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    Err(renderer::RenderError::Reconfigure) => {
                         renderer.resize(window.inner_size());
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        log::error!("Out of GPU memory — exiting");
+                    Err(renderer::RenderError::Fatal) => {
+                        log::error!("Unrecoverable render error — exiting");
                         event_loop.exit();
                     }
-                    Err(e) => log::warn!("Surface error: {e:?}"),
                 }
                 window.request_redraw();
             }
