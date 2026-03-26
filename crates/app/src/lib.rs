@@ -35,10 +35,11 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut attrs = Window::default_attributes().with_title("Webtych");
+        #[cfg(not(target_arch = "wasm32"))]
+        let attrs = Window::default_attributes().with_title("Webtych");
 
         #[cfg(target_arch = "wasm32")]
-        {
+        let attrs = {
             use wasm_bindgen::JsCast;
             use winit::platform::web::WindowAttributesExtWebSys;
 
@@ -56,10 +57,11 @@ impl ApplicationHandler for App {
             canvas.set_width(w);
             canvas.set_height(h);
 
-            attrs = attrs
+            Window::default_attributes()
+                .with_title("Webtych")
                 .with_canvas(Some(canvas))
-                .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
-        }
+                .with_inner_size(winit::dpi::PhysicalSize::new(w, h))
+        };
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
@@ -134,15 +136,17 @@ impl ApplicationHandler for App {
 
 pub fn run() {
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new();
 
     #[cfg(not(target_arch = "wasm32"))]
-    event_loop.run_app(&mut app).unwrap();
+    {
+        let mut app = App::new();
+        event_loop.run_app(&mut app).unwrap();
+    }
 
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn_app(app);
+        event_loop.spawn_app(App::new());
     }
 }
 
