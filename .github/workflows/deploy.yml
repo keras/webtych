@@ -2,17 +2,12 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [main, master, "claude/setup-gha-wgpu-KBXiB"]
+    branches: ["**"]
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages:    write
-  id-token: write
 
 # Only one deployment at a time; cancel in-flight runs on new push.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,7 +30,6 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Install trunk
-        # Download a pre-built binary to avoid a full cargo install compile.
         run: |
           TRUNK_VERSION="0.21.1"
           curl -fsSL \
@@ -46,13 +40,20 @@ jobs:
         run: trunk build --release
 
       - name: Upload Pages artifact
+        # Only upload when we might deploy (main/master), to avoid wasting
+        # artifact storage on every feature-branch push.
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist/
 
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    permissions:
+      pages:    write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
