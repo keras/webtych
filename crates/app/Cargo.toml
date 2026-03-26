@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "webtych-desktop"
+path = "src/main.rs"
+
 [dependencies]
 wgpu = "22"
 winit = "0.30"
