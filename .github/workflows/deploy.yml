@@ -1,18 +1,20 @@
-name: Deploy to GitHub Pages
+name: Build & Deploy
 
 on:
   push:
     branches: ["**"]
   workflow_dispatch:
 
-# Only one deployment at a time; cancel in-flight runs on new push.
 concurrency:
-  group: pages-${{ github.ref }}
+  group: deploy-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push to gh-pages branch
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,28 +38,36 @@ jobs:
             "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin trunk
 
+      - name: Compute deploy destination and public URL
+        id: meta
+        run: |
+          REPO="${{ github.event.repository.name }}"
+          REF="${{ github.ref }}"
+          if [[ "$REF" == "refs/heads/main" ]] || [[ "$REF" == "refs/heads/master" ]]; then
+            DEST="."
+            PUBLIC_URL="/$REPO/"
+          else
+            # Sanitise branch name to a URL-safe string.
+            SAFE=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            DEST="previews/$SAFE"
+            PUBLIC_URL="/$REPO/previews/$SAFE/"
+          fi
+          echo "dest=$DEST"           >> $GITHUB_OUTPUT
+          echo "public_url=$PUBLIC_URL" >> $GITHUB_OUTPUT
+          echo "preview_url=https://${{ github.repository_owner }}.github.io/$REPO/$( [[ "$DEST" == "." ]] && echo '' || echo "$DEST/" )" >> $GITHUB_OUTPUT
+
       - name: Build (release)
-        run: trunk build --release
+        run: trunk build --release --public-url "${{ steps.meta.outputs.public_url }}"
 
-      - name: Upload Pages artifact
-        # Only upload when we might deploy (main/master), to avoid wasting
-        # artifact storage on every feature-branch push.
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        uses: actions/upload-pages-artifact@v3
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: dist/
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir:     ./dist
+          destination_dir: ${{ steps.meta.outputs.dest }}
+          keep_files: true   # preserve other branches' preview dirs
 
-  deploy:
-    needs: build
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    permissions:
-      pages:    write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Write preview URL to job summary
+        run: |
+          echo "### Preview URL" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.preview_url }}" >> $GITHUB_STEP_SUMMARY
