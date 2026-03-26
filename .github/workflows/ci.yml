@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install clippy
+        run: rustup component add clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ci-
+
+      - name: Check (native)
+        run: cargo check
+
+      - name: Check (wasm32)
+        run: cargo check --target wasm32-unknown-unknown --lib -p webtych
+
+      - name: Clippy (native)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (wasm32)
+        run: cargo clippy --target wasm32-unknown-unknown --lib -p webtych -- -D warnings
+
+  smoke-test:
+    name: Browser smoke test
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ci-
+
+      - name: Install trunk
+        run: |
+          TRUNK_VERSION="0.21.1"
+          curl -fsSL \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin trunk
+
+      - name: Build (debug — faster for CI)
+        run: trunk build --public-url /
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Playwright
+        working-directory: tests/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run smoke test
+        working-directory: tests/e2e
+        run: npx playwright test
