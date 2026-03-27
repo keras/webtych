@@ -200,10 +200,6 @@ impl ApplicationHandler for App {
                     Err(renderer::RenderError::Reconfigure) => {
                         renderer.resize(window.inner_size());
                     }
-                    Err(renderer::RenderError::Fatal) => {
-                        log::error!("Unrecoverable render error — exiting");
-                        event_loop.exit();
-                    }
                 }
                 window.request_redraw();
             }

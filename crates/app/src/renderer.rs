@@ -98,8 +98,6 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 pub enum RenderError {
     /// Surface is lost or outdated — caller should call resize().
     Reconfigure,
-    /// Unrecoverable error — caller should exit.
-    Fatal,
 }
 
 // ── Quad vertex data ──────────────────────────────────────────────────────────
@@ -516,7 +514,10 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::Reconfigure),
-            _ => return Err(RenderError::Fatal),
+            // Transient conditions — skip this frame and try again next tick.
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
         };
 
         let view = output
