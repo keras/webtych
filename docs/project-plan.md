@@ -677,7 +677,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 ## 10. Resolved Design Decisions
 
-1. **Color count**: Minimum 5 (matching the original), configurable by difficulty setting. Higher difficulty adds more colors. The LBM architecture imposes no limit — each additional color is just one passive scalar field (~256 KB at 256²) and one advection dispatch per frame.
+1. **Color count**: Minimum 4, configurable by difficulty setting. Higher difficulty adds more colors. The LBM architecture imposes no limit — each additional color is just one passive scalar field (~256 KB at 256²) and one advection dispatch per frame.
 
 2. **Chain reactions**: Yes. Each chain level multiplies `lbm_density_inject` and `particle_count` by a scaling factor, creating escalating pressure waves and spectacle.
 
