@@ -52,7 +52,7 @@ WebGPU is available in Chrome 113+, Edge 113+, Firefox (behind flag, full suppor
 │                   │                  │                │
 │                   │  • rigid bodies  │                │
 │                   │  • contacts      │                │
-│                   │  • soft body*    │                │
+│                   │  • spring joints │                │
 │                   └──────┬───────────┘                │
 │                          │                            │
 │                ┌─────────┴──────────┐                 │
@@ -206,15 +206,16 @@ triptych/
 
 **Engine**: Rapier2D with `wasm-bindgen` + `enhanced-determinism` features.
 
-**Rigid bodies**: Each trimino cell is a separate rigid body connected by fixed joints to its neighbors within the same piece. This allows individual cells to detach during destruction. Restitution ~0.3 (bouncy but not crazy), friction ~0.5.
+**Rigid bodies**: Each trimino cell is a separate rigid body with a rectangular collider. Cells within the same piece are connected by **spring-damper joints** at their shared edges. The cells themselves are rigid — they don't deform — but the springs let the trimino flex, bounce, and wobble as a whole. On impact, cells separate slightly and oscillate, then pull back together. This produces the bouncy "jello" feel at the trimino level without any per-cell deformation.
 
-**Soft-body simulation**: Triptych's signature squishiness. There are two viable approaches:
+Spring parameters (tune to taste):
+- **Stiffness**: High enough that cells don't visibly separate during normal stacking, but low enough that impacts produce visible flex. Start around 500–1000 N/m.
+- **Damping**: Moderate — enough to settle oscillations within ~0.5s but not so much that the wobble is killed instantly. Start around 10–20 Ns/m.
+- **Rest length**: Zero (cells want to be flush against each other).
 
-1. **Spring-damper lattice**: Each trimino cell is a cluster of 4 rigid body particles connected by stiff spring joints. The cell deforms as the particles shift under load. Visually, the cell's rendered quad interpolates its corners from the particle positions. This is cheap on Rapier and gives good visual deformation.
+Restitution ~0.3 (bouncy but not crazy), friction ~0.5.
 
-2. **Pressure soft body**: Model each cell as a closed polygon with edge particles. Internal pressure pushes outward; external forces compress. More complex but more physically accurate jelly behavior.
-
-**Recommended**: Approach 1 (spring-damper) for initial implementation. It's simpler, Rapier handles it natively with impulse joints, and the visual deformation feeds naturally into the GPU obstacle texture.
+When cells are destroyed (match-3 clear), the spring joints connecting them to surviving neighbors are removed, and the surviving cells become independent or form smaller connected groups.
 
 **Contact extraction**: Every physics step, iterate `narrow_phase.contact_pairs()`. For each active contact:
 - Extract contact normal, penetration depth, relative velocity.
@@ -233,9 +234,8 @@ A 2D grid (matching the fluid grid resolution) carrying both a solid/empty mask 
 
 Generation (CPU-side):
 1. For each physics body, retrieve its current position, rotation, and linear velocity.
-2. Rasterize the body's collider shape onto the grid, filling covered cells with `(1.0, vel.x, vel.y, 0.0)`.
+2. Rasterize the body's rectangular collider onto the grid, filling covered cells with `(1.0, vel.x, vel.y, 0.0)`.
 3. **Sweep fill**: For each body, also fill the cells between last frame's position and this frame's position. This prevents fast-moving obstacles from tunneling through fluid cells in a single timestep. Sweep by translating the shape along its frame-to-frame displacement vector and filling all intermediate cells. Tag swept cells with the body's velocity.
-4. For the spring-damper soft bodies, use the convex hull of each cell's 4 particles as the rasterization shape.
 
 Empty cells are `(0.0, 0.0, 0.0, 0.0)`. The LBM solver uses this texture in its boundary pass: at solid cells, the moving bounce-back scheme reflects distributions with a velocity correction from the obstacle velocity. This transfers momentum from moving obstacles into the fluid, causing gas to be pushed out of narrowing gaps naturally — no explicit squeeze injection needed.
 
@@ -265,12 +265,12 @@ Per-block instance data for the geometry render pass:
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct BlockInstance {
-    // corners from the 4 spring-damper particles
-    corners: [[f32; 2]; 4],
+    position: [f32; 2],       // center position from rigid body
+    rotation: f32,            // angle in radians from rigid body
     color_id: u32,
     alive: u32,               // 0 = being destroyed (trigger dissolve shader)
     destroy_progress: f32,    // 0.0 → 1.0 animation
-    _pad: f32,
+    _pad: [f32; 2],
 }
 ```
 
@@ -457,9 +457,8 @@ Compared to the Stam solver approach, the LBM version is more physically accurat
 ### 6.7 Render Pipeline
 
 **Pass 1 — Block geometry** (render pass):
-- Instanced quads with per-instance corner positions from the spring-damper particles.
-- Vertex shader deforms the quad mesh to match the soft body shape.
-- Fragment shader: procedural jelly shading — slight internal refraction, specular highlight that shifts with deformation, color from `color_id`.
+- Instanced quads with per-instance position and rotation from the rigid body transforms.
+- Vertex shader applies a simple 2D rotation + translation.
 - Blocks being destroyed (`alive == 0`) run a dissolve shader keyed on `destroy_progress`: noise-based erosion from edges inward.
 
 **Pass 2 — Fluid smoke** (render pass):
@@ -583,15 +582,15 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [x] Game over detection (stack reaches top).
 - [x] Instanced block rendering on GPU — flat color, no deformation yet.
 
-### Phase 2 — Soft Body Deformation
+### Phase 2 — Spring-Connected Blocks
 
-**Goal**: Blocks visually squish and bounce. The "jello" feel.
+**Goal**: Blocks wobble and flex on impact. The trimino feels bouncy and alive.
 
-- [ ] Replace single rigid body per cell with 4-particle spring-damper cluster.
-- [ ] Tune spring stiffness and damping for satisfying squish.
-- [ ] Upload corner positions as instance data.
-- [ ] Block vertex shader: deform quad from corner positions.
-- [ ] Block fragment shader: procedural jelly material (fake refraction, specular).
+- [ ] Connect trimino cells with spring-damper joints at shared edges.
+- [ ] Tune spring stiffness and damping for satisfying wobble on impact.
+- [ ] Remove spring joints on cell destruction, let surviving cells separate or regroup.
+- [ ] Upload per-block position + rotation as instance data.
+- [ ] Block vertex shader: transform quad by position and rotation.
 
 ### Phase 3 — Fluid Simulation Foundation
 
@@ -667,7 +666,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 |---|---|---|---|
 | WebGPU compute shaders unavailable in target browser | Blocks shipping | Low (Chrome/Edge stable, Safari 18+) | Display clear error message; no WebGL fallback |
 | Fluid sim too slow at 256² on integrated GPUs | Visual quality degradation | Medium | Dynamic grid scaling: query adapter, start at 128² on weak hardware |
-| Rapier's spring joints produce unstable soft bodies | Gameplay feel broken | Medium | Tune spring constants carefully; fall back to rigid bodies with vertex deformation shader only |
+| Rapier's spring joints between cells produce jittery or unstable behavior | Gameplay feel broken | Low | Spring-connected rigid blocks are simpler than deformable soft bodies and well within Rapier's comfort zone. If needed, increase damping or switch to fixed joints (losing the wobble but keeping stability) |
 | WASM binary too large (>10 MB) | Slow page load | Low | No heavy dependencies; `wasm-opt`, LTO, no debug symbols in release |
 | Pressure Jacobi solver doesn't converge in 20 iterations | Visual artifacts in fluid | Medium | N/A — replaced by LBM which has no iterative solve. LBM stability depends on τ staying above 0.5 and Mach number staying low (velocity << c_s). Clamp injection density to prevent supersonic flow |
 | GPU buffer limits hit on low-end devices | Crash on init | Low | Query `maxStorageBufferBindingSize`, scale particle pool and grid accordingly |
@@ -732,13 +731,15 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 **Semi-Lagrangian advection** — A technique for moving a field through a velocity field: for each cell, trace backward along the velocity to find where the material came from, then interpolate. Used here only for the passive color densities, not the LBM itself.
 
+**Spring-damper joint** — A physics joint that connects two rigid bodies with a spring force (pulls them toward a rest distance) and a damping force (resists relative velocity). Used here to connect trimino cells — the spring provides the wobble, the damper prevents endless oscillation.
+
 **Storage buffer** — A GPU buffer that compute shaders can read from and write to. Unlike uniform buffers, storage buffers can be large and support random access. Used for LBM distributions, particles, and color densities.
 
 **Streaming (LBM)** — The step where each distribution is shifted to its neighboring cell along its lattice direction. This propagates information (pressure waves, momentum) through the grid. Combined with collision, it produces correct fluid dynamics.
 
 **Sweep fill** — When rasterizing the obstacle texture, filling not just the body's current position but all cells between the previous and current positions. Prevents fast-moving objects from tunneling through the fluid grid between frames.
 
-**Trimino** — A game piece made of three connected cells (the Triptych equivalent of a Tetris tetromino). Each cell has a color. Cells can be individually destroyed when matched.
+**Trimino** — A game piece made of three connected cells (the Triptych equivalent of a Tetris tetromino). Each cell is a separate rigid body connected to its neighbors by spring-damper joints, allowing the piece to flex and wobble. Each cell has a color and can be individually destroyed when matched.
 
 **Workgroup** — A group of GPU threads that execute together and can share local memory. WebGPU limits apply per-workgroup. This project uses 8×8 = 64 threads per workgroup, the recommended default for WebGPU portability.
 
