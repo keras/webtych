@@ -73,13 +73,13 @@ WebGPU is available in Chrome 113+, Edge 113+, Firefox (behind flag, full suppor
 │                   GPU Pipeline                        │
 │                                                      │
 │  ┌────────────────────────────────────────────┐      │
-│  │  Compute: Fluid Simulation                  │      │
-│  │  1. Apply forces + event injections         │      │
-│  │  2. Apply boundary (obstacle velocity)      │      │
-│  │  3. Advect velocity (semi-Lagrangian)       │      │
-│  │  4. Pressure solve (Jacobi, N iterations)   │      │
-│  │  5. Pressure projection + boundary enforce  │      │
-│  │  6. Advect density fields                   │      │
+│  │  Compute: Fluid Simulation (LBM D2Q9)      │      │
+│  │  1. Event injection (density + body force)  │      │
+│  │  2. Collision (BGK relaxation + forces)     │      │
+│  │  3. Streaming (propagate distributions)     │      │
+│  │  4. Boundary (bounce-back w/ obstacle vel)  │      │
+│  │  5. Extract macroscopic velocity + density  │      │
+│  │  6. Advect color density fields             │      │
 │  └────────────────────────────────────────────┘      │
 │                                                      │
 │  ┌────────────────────────────────────────────┐      │
@@ -151,7 +151,7 @@ triptych/
 │   │   │   ├── fluid/
 │   │   │   │   ├── mod.rs
 │   │   │   │   ├── grid.rs       # FluidGrid: textures, bind groups, dispatch
-│   │   │   │   ├── solver.rs     # advection, pressure, projection, event injection
+│   │   │   │   ├── solver.rs     # LBM D2Q9: collision, streaming, macroscopic extraction
 │   │   │   │   └── boundary.rs   # obstacle texture: mask + velocity, sweep fill
 │   │   │   ├── particles/
 │   │   │   │   ├── mod.rs
@@ -170,11 +170,12 @@ triptych/
 │   │   │   ├── effects.rs        # ColorEffect trait, per-color effect registry
 │   │   │   └── renderer.rs       # orchestrates full frame: compute → render → post
 │   │   ├── shaders/              # .wgsl source files
-│   │   │   ├── fluid_advect.wgsl
-│   │   │   ├── fluid_pressure.wgsl
-│   │   │   ├── fluid_project.wgsl
-│   │   │   ├── fluid_inject.wgsl
-│   │   │   ├── fluid_boundary.wgsl
+│   │   │   ├── lbm_collide.wgsl
+│   │   │   ├── lbm_stream.wgsl
+│   │   │   ├── lbm_boundary.wgsl
+│   │   │   ├── lbm_inject.wgsl
+│   │   │   ├── lbm_extract.wgsl
+│   │   │   ├── density_advect.wgsl
 │   │   │   ├── particle_update.wgsl
 │   │   │   ├── particle_render.wgsl
 │   │   │   ├── block_vert.wgsl
@@ -236,7 +237,7 @@ Generation (CPU-side):
 3. **Sweep fill**: For each body, also fill the cells between last frame's position and this frame's position. This prevents fast-moving obstacles from tunneling through fluid cells in a single timestep. Sweep by translating the shape along its frame-to-frame displacement vector and filling all intermediate cells. Tag swept cells with the body's velocity.
 4. For the spring-damper soft bodies, use the convex hull of each cell's 4 particles as the rasterization shape.
 
-Empty cells are `(0.0, 0.0, 0.0, 0.0)`. The fluid solver uses this texture in its boundary enforcement step: at any cell where the mask is 1.0, the fluid velocity is set to the obstacle velocity (the standard moving-boundary no-penetration condition in CFD). The pressure solver then naturally generates the pressure gradients needed to push fluid laterally out of narrowing gaps — no explicit squeeze injection needed.
+Empty cells are `(0.0, 0.0, 0.0, 0.0)`. The LBM solver uses this texture in its boundary pass: at solid cells, the moving bounce-back scheme reflects distributions with a velocity correction from the obstacle velocity. This transfers momentum from moving obstacles into the fluid, causing gas to be pushed out of narrowing gaps naturally — no explicit squeeze injection needed.
 
 **B. Event ring buffer**
 
@@ -273,42 +274,100 @@ struct BlockInstance {
 }
 ```
 
-### 6.3 Fluid Simulation (GPU Compute)
+### 6.3 Fluid Simulation (GPU Compute) — Lattice Boltzmann Method
 
-An Eulerian 2D grid-based fluid solver running entirely in compute shaders. Based on Jos Stam's stable fluids method, adapted for GPU.
+A D2Q9 Lattice Boltzmann solver running entirely in compute shaders. Unlike the Stam stable-fluids approach (incompressible, iterative pressure solve), LBM is inherently compressible and non-iterative — pressure waves, gas expansion, and shock-like effects emerge naturally from the simulation. Each cell update is purely local (read neighbors, compute, write self), making it an ideal fit for GPU compute.
 
 **Grid resolution**: 256×256 as default on WASM. 512×512 on native. Configurable at init based on adapter limits.
 
-**Textures** (all `Rgba32Float` or `Rg32Float`):
+#### D2Q9 Lattice
 
-| Texture | Format | Purpose |
-|---|---|---|
-| `velocity_0` | `Rg32Float` | Velocity field (ping) |
-| `velocity_1` | `Rg32Float` | Velocity field (pong) |
-| `pressure_0` | `R32Float` | Pressure field (ping) |
-| `pressure_1` | `R32Float` | Pressure field (pong) |
-| `divergence` | `R32Float` | Divergence of velocity |
-| `density_rgba` | `Rgba32Float` | Density per color channel (up to 4 colors packed) |
-| `density_rgba_2` | `Rgba32Float` | Second density texture (if >4 colors) |
-| `obstacle` | `Rgba16Float` | Boundary mask (R) + obstacle velocity (GB), CPU-uploaded |
+Each cell stores 9 distribution functions `f_i` corresponding to the 9 lattice velocities:
 
-**Compute passes per frame** (in order):
+```
+6  2  5
+ \ | /
+3--0--1
+ / | \
+7  4  8
+```
 
-1. **Force injection** (`fluid_inject.wgsl`): Read event buffer. For each destroy event, apply radial velocity burst + density injection at the event position, scaled by intensity and parameterized by `color_id`. For impact events, apply a smaller burst scaled by impact velocity.
+Velocities: `e_0 = (0,0)`, `e_1 = (1,0)`, `e_2 = (0,1)`, `e_3 = (-1,0)`, `e_4 = (0,-1)`, `e_5 = (1,1)`, `e_6 = (-1,1)`, `e_7 = (-1,-1)`, `e_8 = (1,-1)`.
 
-2. **Boundary enforcement** (`fluid_boundary.wgsl`): For every grid cell, sample the obstacle texture. If the mask channel (R) is ≥ 0.5, set the velocity field at that cell to the obstacle's velocity (from G and B channels). This is the standard moving-boundary no-penetration condition. The pressure solver in the next steps will generate the pressure gradients that push fluid laterally out of narrowing gaps — gas compression emerges naturally from incompressibility, with no explicit squeeze logic.
+Weights: `w_0 = 4/9`, `w_{1-4} = 1/9`, `w_{5-8} = 1/36`.
 
-3. **Advect velocity** (`fluid_advect.wgsl`): Semi-Lagrangian advection. For each cell, trace backward along velocity, bilinearly sample the previous velocity field. Write to ping-pong target. Apply vorticity confinement here (curl → cross product force → add to velocity).
+Macroscopic quantities extracted from distributions:
+- Fluid density: `ρ = Σ f_i`
+- Fluid velocity: `u = (1/ρ) Σ f_i × e_i`
+- Pressure: `p = ρ × c_s²` where `c_s² = 1/3` (lattice speed of sound squared)
 
-4. **Compute divergence** (`fluid_pressure.wgsl`, pass 1): Finite differences on the velocity field.
+#### GPU Buffers
 
-5. **Pressure solve** (`fluid_pressure.wgsl`, passes 2..N): Jacobi iteration. 20–40 iterations is typical; on WASM, 20 is a good perf/quality tradeoff. Each iteration dispatches the full grid once, ping-ponging between `pressure_0` and `pressure_1`. The obstacle texture enforces Neumann boundary (zero pressure gradient at solid walls).
+| Buffer | Format | Size (256² grid) | Purpose |
+|---|---|---|---|
+| `distributions_0` | Storage buffer, `f32 × 9` per cell | ~2.4 MB | Distribution functions (ping) |
+| `distributions_1` | Storage buffer, `f32 × 9` per cell | ~2.4 MB | Distribution functions (pong) |
+| `macroscopic` | Storage buffer, `f32 × 3` per cell | ~768 KB | Extracted ρ, u.x, u.y per cell |
+| `obstacle` | `Rgba16Float` texture | ~512 KB | Boundary mask (R) + obstacle velocity (GB), CPU-uploaded |
+| `density_colors` | Storage buffer, `f32 × N` per cell | ~256 KB per color | Passive scalar density per color |
 
-6. **Pressure projection** (`fluid_project.wgsl`): Subtract pressure gradient from velocity to enforce incompressibility. Re-enforce obstacle boundary: at any cell where the obstacle mask is solid, reset velocity to the obstacle's stored velocity. This ensures the moving-boundary condition is maintained after projection.
+Total GPU memory at 256²: ~7 MB. At 512²: ~28 MB. Well within WebGPU limits.
 
-7. **Advect density** (`fluid_advect.wgsl`, reused with different bindings): Advect each density channel through the now-divergence-free velocity field. Apply slight diffusion (controlled dissipation rate per color).
+#### Compute Passes Per Frame (in order)
 
-**Workgroup size**: 8×8 = 64 threads per workgroup (WebGPU-friendly default). Dispatch `ceil(grid_w/8) × ceil(grid_h/8)` workgroups per pass.
+1. **Event injection** (`lbm_inject.wgsl`): Read the event ring buffer. For each destroy event, modify the distributions at the event cells to represent elevated fluid density (high ρ). This is done by setting `f_i = w_i × ρ_inject` at those cells, where `ρ_inject` is the desired overpressure. The resulting density imbalance with surrounding cells creates a pressure gradient that the collision and streaming steps will naturally expand outward. Also inject colored smoke density into the corresponding color channel. The `color_id` and intensity from the event parameterize both the LBM density injection strength and the smoke color density amount, controlled by the per-color effect profile.
+
+2. **Collision** (`lbm_collide.wgsl`): For each non-obstacle cell, compute the BGK (Bhatnagar-Gross-Krook) relaxation:
+
+   ```
+   f_i_new = f_i - (1/τ) × (f_i - f_i_eq) + F_i
+   ```
+
+   Where `τ` is the relaxation time (controls viscosity: `ν = c_s² × (τ - 0.5)`), `f_i_eq` is the equilibrium distribution computed from local ρ and u, and `F_i` is an optional body force term (e.g. gravity on smoke, buoyancy). The equilibrium is:
+
+   ```
+   f_i_eq = w_i × ρ × (1 + (e_i · u)/c_s² + (e_i · u)²/(2×c_s⁴) - (u · u)/(2×c_s²))
+   ```
+
+   This is the most ALU-heavy pass but still a single dispatch over the full grid.
+
+3. **Streaming** (`lbm_stream.wgsl`): Propagate each distribution to its neighbor cell along its lattice direction. `f_i` at cell `(x, y)` moves to cell `(x + e_i.x, y + e_i.y)`. This is a pure data-shuffle — each thread reads from its neighbor and writes to itself (pull scheme) or reads from itself and writes to its neighbor (push scheme). Pull scheme is simpler for boundary handling. Ping-pong between `distributions_0` and `distributions_1`.
+
+4. **Boundary enforcement** (`lbm_boundary.wgsl`): For cells marked as solid in the obstacle texture, apply the **moving bounce-back** scheme. Distributions arriving at a solid cell are reflected back the way they came, with a velocity correction for the obstacle's motion:
+
+   ```
+   f_opposite(x, t+1) = f_i(x, t_post_collision) - 2 × w_i × ρ_wall × (e_i · u_wall) / c_s²
+   ```
+
+   Where `u_wall` is the obstacle velocity from the obstacle texture's GB channels, and `opposite` is the index of the reverse direction. This correctly transfers momentum from moving obstacles to the fluid — a falling block pushes fluid downward, two closing blocks squeeze fluid laterally — all emerging from the same bounce-back rule.
+
+5. **Extract macroscopic quantities** (`lbm_extract.wgsl`): For each cell, sum the distributions to get ρ and u (see formulas above). Write to the `macroscopic` buffer. This velocity field is what particles sample for fluid coupling, and it can also be used in the smoke render pass if needed.
+
+6. **Advect color densities** (`density_advect.wgsl`): Semi-Lagrangian advection of each passive color density field through the extracted velocity field. For each cell, trace backward along u, bilinearly sample the previous color density, write the result. Apply dissipation (multiply by a decay factor per color, per frame). This is the only pass that uses semi-Lagrangian advection — the LBM itself doesn't need it.
+
+**Workgroup size**: 8×8 = 64 threads per workgroup. Dispatch `ceil(grid_w/8) × ceil(grid_h/8)` workgroups per pass.
+
+#### Relaxation Time (τ) and Viscosity
+
+The relaxation time τ controls how quickly the fluid relaxes toward equilibrium, which maps to kinematic viscosity: `ν = (1/3) × (τ - 0.5)`. For visual smoke:
+
+- `τ = 0.6` → low viscosity, fast swirling, turbulent look.
+- `τ = 0.8` → moderate viscosity, smooth billowing.
+- `τ = 1.0+` → high viscosity, thick syrupy flow.
+
+Start with `τ ≈ 0.7` and tune for visual feel. Values too close to 0.5 cause instability. This is a single uniform value — trivial to tweak at runtime.
+
+#### Destruction as Pressure Injection
+
+When blocks are destroyed, the cleared grid cells transition from obstacle (solid) to fluid (empty) and simultaneously receive a high-density distribution injection. The mechanism:
+
+1. Obstacle texture is updated: destroyed block cells go from mask=1 to mask=0.
+2. The injection pass sets distributions at those cells to equilibrium at elevated density `ρ_inject` (e.g. 3–5× ambient ρ₀=1.0) with zero velocity.
+3. The collision pass sees these cells as high-density surrounded by ambient-density neighbors.
+4. Streaming naturally propagates the excess density outward. The density gradient drives outward velocity — this is a compressible pressure wave.
+5. Over several frames, the wave expands, reflects off obstacles, and dissipates.
+
+Different colors inject different `ρ_inject` values (from the effect profile), producing different expansion strengths. A heavy color produces a powerful blast; a light color produces a gentle puff. The geometry of surrounding blocks shapes the expansion — a block destroyed in a tight corner produces a directed jet through the available opening, while one in open space produces a symmetric expansion. All of this is emergent, not authored.
 
 ### 6.4 Particle System (GPU Compute)
 
@@ -331,7 +390,7 @@ struct Particle {
 **Emission**: When a destroy or impact event fires, the CPU writes an emission command to a small emission buffer: `{ position, count, color_id, effect_type, velocity_spread }`. The particle update compute pass reads these, atomically allocates from a free-list (atomic counter on the pool), and initializes new particles.
 
 **Update pass** (`particle_update.wgsl`):
-1. For each active particle, sample the fluid velocity texture at the particle's grid-space position.
+1. For each active particle, sample the macroscopic velocity buffer at the particle's grid-space position.
 2. Blend the fluid velocity into the particle velocity (configurable coupling strength — full coupling makes particles drift with smoke, low coupling keeps them ballistic with just a nudge).
 3. Apply gravity, drag.
 4. Integrate position (Euler is fine for visual particles).
@@ -345,11 +404,11 @@ Each block color maps to a destruction effect profile, defined as a data-driven 
 
 ```rust
 struct ColorEffect {
-    // Fluid injection
-    smoke_density: f32,           // how much density to inject
-    smoke_color: [f32; 4],        // RGBA of injected density
-    velocity_burst_strength: f32, // radial velocity magnitude
-    vorticity_boost: f32,         // extra curl at injection site
+    // Fluid injection (LBM)
+    lbm_density_inject: f32,      // ρ_inject value (e.g. 2.0–5.0× ambient)
+    smoke_density: f32,           // how much colored smoke density to inject
+    smoke_color: [f32; 4],        // RGBA of injected smoke
+    smoke_dissipation: f32,       // per-frame decay rate for this color's smoke
 
     // Particles
     particle_count: u32,          // how many to emit on destroy
@@ -370,30 +429,30 @@ struct ColorEffect {
 
 Example profiles:
 
-- **Red**: Heavy smoke, slow billowing, deep crimson density, moderate particles with ember trails, strong bloom.
-- **Blue**: Minimal smoke, sharp velocity burst (water-splash feel), many small fast particles, screen ripple distortion.
-- **Green**: Swirling vortex (high `vorticity_boost`), spiral particle emission, green-tinted wispy density.
-- **Yellow**: Bright flash (high `bloom_boost`), explosive radial particles, minimal smoke, strong screen shake.
-- **Purple**: Dense lingering smoke cloud, slow fade, large soft particles, chromatic aberration distortion.
+- **Red**: High `lbm_density_inject` (4.0×), heavy smoke, slow dissipation — a powerful billowing explosion with deep crimson density, moderate particles with ember trails, strong bloom.
+- **Blue**: Moderate `lbm_density_inject` (2.5×), minimal smoke, fast dissipation — a sharp pressure pop (water-splash feel), many small fast particles, screen ripple distortion.
+- **Green**: Moderate `lbm_density_inject` (3.0×), medium smoke — the expansion interacts with surrounding geometry to create swirling patterns, spiral particle emission, green-tinted wispy density.
+- **Yellow**: High `lbm_density_inject` (5.0×), minimal smoke, fast dissipation — a powerful pressure wave with bright flash (`bloom_boost`), explosive radial particles, strong screen shake.
+- **Purple**: Low `lbm_density_inject` (1.5×), very heavy smoke, very slow dissipation — a gentle expansion that leaves a dense lingering cloud, large soft particles, chromatic aberration distortion.
 
 These profiles are loaded as a uniform buffer, indexed by `color_id` in the shaders.
 
 ### 6.6 Moving Boundary Fluid Interaction
 
-Gas compression effects (e.g. air being squeezed out between two closing blocks) emerge naturally from the fluid solver rather than being driven by an explicit system. The mechanism:
+Gas compression effects (e.g. air being squeezed out between two closing blocks) emerge naturally from the LBM solver rather than being driven by an explicit system. The mechanism:
 
 1. The obstacle texture carries each solid cell's velocity (see §6.2A).
-2. The boundary enforcement pass writes obstacle velocity into the fluid velocity field at solid cells.
-3. Two blocks closing toward each other impose inward velocities on the fluid between them.
-4. The pressure solver enforces incompressibility (divergence-free velocity field). Since the fluid between the blocks is being driven inward from both sides but cannot compress, the solver generates a pressure field that redirects flow laterally out the open sides of the gap.
-5. As the gap narrows across successive frames, fewer fluid cells remain between the blocks, but the pressure gradient per cell increases — so the lateral outflow velocity accelerates naturally.
-6. When the gap closes completely, both bodies become adjacent solid regions in the obstacle texture and the fluid simply flows around them.
+2. The boundary pass applies moving bounce-back: distributions arriving at solid cells are reflected with a velocity correction proportional to the obstacle's velocity. This transfers momentum from the moving obstacle into the fluid.
+3. Two blocks closing toward each other impose inward momentum on the fluid between them via bounce-back at both surfaces.
+4. Because LBM is inherently compressible, the fluid between the blocks actually compresses — density (and therefore pressure) rises in the narrowing gap.
+5. The elevated pressure drives lateral outflow through the open sides of the gap. As the gap narrows, pressure increases and outflow accelerates.
+6. When the gap closes completely, both bodies become adjacent solid regions in the obstacle texture and the fluid flows around them.
 
-This replaces any need for a CPU-side gap tracker or explicit squeeze event injection. The only CPU work is the obstacle texture rasterization with sweep fill (already required for correct boundary handling).
+Compared to the Stam solver approach, the LBM version is more physically accurate here — the gas genuinely compresses before being expelled, rather than relying on an incompressibility constraint to redirect flow. This means you can see a brief pressure buildup before the lateral jet, which looks more natural.
 
-**Tuning**: If the effect is too subtle visually, scale up the obstacle velocities written to the texture by a factor (e.g. 1.5×). This exaggerates the compression effect without breaking the simulation — the pressure solver still produces a physically plausible flow pattern, just amplified. If the effect is too violent (fluid blowing out too fast), reduce the multiplier or increase fluid viscosity in the gap region.
+**Tuning**: Scale obstacle velocities in the texture by a multiplier (e.g. 1.5×) to exaggerate the effect. Adjusting τ (relaxation time) also affects how the compression behaves — lower τ produces sharper, more turbulent jets, higher τ produces smoother expulsion.
 
-**Sweep fill is critical here**: Without it, a block that moves 3 grid cells in one frame would teleport past the intervening fluid rather than pushing through it. The sweep fill ensures all intermediate cells are tagged as solid with the correct velocity, giving the pressure solver a continuous wall to work with.
+**Sweep fill remains critical**: Without it, fast-moving blocks tunnel through fluid cells. The sweep fill ensures all intermediate cells receive bounce-back boundary conditions, giving the LBM a continuous moving wall to interact with.
 
 ### 6.7 Render Pipeline
 
@@ -405,7 +464,7 @@ This replaces any need for a CPU-side gap tracker or explicit squeeze event inje
 
 **Pass 2 — Fluid smoke** (render pass):
 - Full-screen quad.
-- Fragment shader samples `density_rgba` (and optionally `density_rgba_2`), maps each channel to its color profile's smoke color, composites additively.
+- Fragment shader samples each color's density field from the `density_colors` storage buffer, multiplies by the color profile's smoke tint, composites additively.
 - Apply exponential fog falloff based on density magnitude for depth-like effect.
 
 **Pass 3 — Particles** (render pass):
@@ -483,12 +542,13 @@ On WASM, `winit` translates browser keyboard events. Ensure the canvas has focus
 |---|---|
 | Physics step (Rapier) | ≤ 3 ms |
 | CPU → GPU uploads (obstacle tex w/ velocity, events, instances) | ≤ 1.5 ms |
-| Fluid sim (6 compute passes × 256² grid) | ≤ 4 ms GPU |
+| LBM sim (inject + collide + stream + boundary + extract, 256² grid) | ≤ 3 ms GPU |
+| Color density advection (per-color passive scalar) | ≤ 1 ms GPU |
 | Particle update (64K) | ≤ 1 ms GPU |
 | Render passes (blocks + smoke + particles + post) | ≤ 4 ms GPU |
 | **Total** | **≤ 13.5 ms** (headroom for 16.6 ms frame) |
 
-If pressure solve iterations dominate, reduce from 20 to 12 or drop grid to 128×128. Profile early on target hardware.
+The LBM passes are fewer than the Stam solver (no iterative pressure solve), so the fluid sim budget is potentially tighter. The collision pass is ALU-heavier per cell but bandwidth-lighter overall. Profile early on target hardware.
 
 ### 7.6 Asset Loading
 
@@ -498,32 +558,32 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 ## 8. Implementation Phases
 
-### Phase 0 — Scaffolding (1–2 weeks)
+### Phase 0 — Scaffolding
 
 **Goal**: Window opens, wgpu renders a colored triangle, builds and runs in both native and WASM.
 
-- [ ] Workspace setup: `game`, `gpu`, `app` crates.
-- [ ] `winit` event loop with platform-conditional init (native vs WASM).
-- [ ] `wgpu` context creation, surface configuration.
-- [ ] Basic render pass: clear screen + hardcoded triangle.
-- [ ] Trunk build config, verify WASM runs in Chrome.
-- [ ] CI: build both targets (native + wasm).
+- [x] Workspace setup: `game`, `gpu`, `app` crates.
+- [x] `winit` event loop with platform-conditional init (native vs WASM).
+- [x] `wgpu` context creation, surface configuration.
+- [x] Basic render pass: clear screen + hardcoded triangle.
+- [x] Trunk build config, verify WASM runs in Chrome.
+- [x] CI: build both targets (native + wasm).
 
-### Phase 1 — Core Game Loop (2–3 weeks)
+### Phase 1 — Core Game Loop
 
 **Goal**: Triminos fall, stack, and clear. No visual effects. Blocks are flat colored quads.
 
-- [ ] Rapier2D integration: world setup, gravity, walls.
-- [ ] Trimino definitions: shapes, colors, random bag.
-- [ ] Piece spawning and input-controlled movement/rotation.
-- [ ] Contact-based stacking (restitution, friction tuning).
-- [ ] Match-3+ detection: flood fill on contacting same-color cells.
-- [ ] Destruction: remove matched cells, fire `DestroyEvent`.
-- [ ] Scoring, level progression, increasing drop speed.
-- [ ] Game over detection (stack reaches top).
-- [ ] Instanced block rendering on GPU — flat color, no deformation yet.
+- [x] Rapier2D integration: world setup, gravity, walls.
+- [x] Trimino definitions: shapes, colors, random bag.
+- [x] Piece spawning and input-controlled movement/rotation.
+- [x] Contact-based stacking (restitution, friction tuning).
+- [x] Match-3+ detection: flood fill on contacting same-color cells.
+- [x] Destruction: remove matched cells, fire `DestroyEvent`.
+- [x] Scoring, level progression, increasing drop speed.
+- [x] Game over detection (stack reaches top).
+- [x] Instanced block rendering on GPU — flat color, no deformation yet.
 
-### Phase 2 — Soft Body Deformation (1–2 weeks)
+### Phase 2 — Soft Body Deformation
 
 **Goal**: Blocks visually squish and bounce. The "jello" feel.
 
@@ -533,45 +593,49 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Block vertex shader: deform quad from corner positions.
 - [ ] Block fragment shader: procedural jelly material (fake refraction, specular).
 
-### Phase 3 — Fluid Simulation Foundation (2–3 weeks)
+### Phase 3 — Fluid Simulation Foundation
 
-**Goal**: Smoke appears and flows around blocks. Moving boundaries push fluid naturally.
+**Goal**: LBM fluid sim runs on GPU. Smoke appears and flows around blocks. Moving boundaries push fluid naturally.
 
-- [ ] Allocate fluid grid textures and bind groups.
-- [ ] Implement advection compute shader (semi-Lagrangian).
-- [ ] Implement pressure solve (Jacobi iterations, ping-pong).
-- [ ] Implement projection pass.
+- [ ] Allocate LBM distribution buffers (2 × 9 floats per cell, ping-pong) and macroscopic buffer.
+- [ ] Implement collision compute shader (BGK relaxation with equilibrium calculation).
+- [ ] Implement streaming compute shader (pull scheme, ping-pong).
+- [ ] Implement macroscopic extraction pass (ρ, u from distributions).
 - [ ] Obstacle texture with velocity: rasterize physics bodies to `Rgba16Float` grid (mask + velocity).
 - [ ] Sweep fill: fill intermediate cells between previous and current body positions.
-- [ ] Boundary enforcement pass: set fluid velocity to obstacle velocity at solid cells.
-- [ ] Test: manually inject density, watch it flow around blocks and get pushed by moving blocks.
-- [ ] Smoke render pass: full-screen quad sampling density.
-- [ ] Performance profiling on WASM — tune grid size and iteration count.
+- [ ] Implement moving bounce-back boundary pass using obstacle texture.
+- [ ] Allocate color density buffers, implement semi-Lagrangian advection for passive scalars.
+- [ ] Test: manually inject high-density region, watch pressure wave expand around blocks.
+- [ ] Smoke render pass: full-screen quad sampling color density fields.
+- [ ] Tune τ (relaxation time) for visual feel — start at 0.7.
+- [ ] Performance profiling on WASM — tune grid size.
 
-### Phase 4 — Destruction Effects (2 weeks)
+### Phase 4 — Destruction Effects
 
-**Goal**: Clearing blocks produces per-color smoke and particle explosions.
+**Goal**: Clearing blocks produces per-color pressure explosions and particle effects.
 
 - [ ] Event ring buffer: CPU writes destroy events, GPU reads.
-- [ ] Fluid injection pass: radial velocity burst + density at event positions.
+- [ ] LBM injection pass: set elevated ρ in distributions at destroyed cells + inject colored smoke density.
+- [ ] Verify pressure wave expands outward and is shaped by surrounding geometry.
 - [ ] Particle system: storage buffer pool, emission from events, lifetime management.
 - [ ] Particle compute update: gravity, drag, basic integration.
 - [ ] Particle render: instanced billboards, additive blending.
-- [ ] Per-color effect profiles: define 4–6 color schemes.
+- [ ] Per-color effect profiles: define 5+ color schemes with different `lbm_density_inject` values.
 - [ ] Block dissolve shader: noise erosion keyed on `destroy_progress`.
 
-### Phase 5 — Fluid–Physics Integration & Particle Coupling (1–2 weeks)
+### Phase 5 — Fluid–Physics Integration & Particle Coupling
 
-**Goal**: Gas visibly squeezes between closing blocks via the moving boundary system. Particles drift in smoke.
+**Goal**: Gas visibly compresses and squeezes between closing blocks via LBM bounce-back. Particles drift in smoke.
 
-- [ ] Validate gas compression: drop block onto stack, verify fluid is pushed laterally by moving boundaries.
+- [ ] Validate gas compression: drop block onto stack, verify fluid density rises in gap and expels laterally.
 - [ ] Tune obstacle velocity multiplier for visual punch (start at 1.0×, try 1.5×).
+- [ ] Tune τ for different visual qualities (turbulent vs smooth expulsion).
 - [ ] Verify sweep fill prevents tunneling at high drop speeds.
-- [ ] Particle–fluid coupling: sample fluid velocity in particle update pass.
+- [ ] Particle–fluid coupling: sample extracted velocity field in particle update pass.
 - [ ] Tune coupling strength per effect type (smoke particles: high coupling, sparks: low coupling).
-- [ ] Stress test: rapid chain clears + fast drops, verify fluid stays stable and performance holds.
+- [ ] Stress test: rapid chain clears + fast drops, verify LBM stays stable and performance holds.
 
-### Phase 6 — Post-Processing & Polish (2 weeks)
+### Phase 6 — Post-Processing & Polish
 
 **Goal**: Bloom, distortion, screen shake. The game looks finished.
 
@@ -583,12 +647,12 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Ambient background: subtle parallax grid or gradient.
 - [ ] UI: score display, level, next piece preview (simple text or quads).
 
-### Phase 7 — Optimization & Shipping (2 weeks)
+### Phase 7 — Optimization & Shipping
 
 **Goal**: Stable 60 FPS on mid-range hardware in Chrome. Polished release.
 
 - [ ] GPU profiling: `wgpu` timestamp queries (where supported), Chrome GPU profiler.
-- [ ] Reduce pressure solve iterations if needed.
+- [ ] LBM dispatch optimization: verify collision + streaming fit within budget; reduce grid if needed.
 - [ ] Particle LOD: reduce max particles on low-end detected via adapter info.
 - [ ] WASM binary size optimization: `wasm-opt -O3`, `lto = true`, `opt-level = 'z'`.
 - [ ] Touch controls (stretch goal for mobile browsers).
@@ -605,21 +669,79 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 | Fluid sim too slow at 256² on integrated GPUs | Visual quality degradation | Medium | Dynamic grid scaling: query adapter, start at 128² on weak hardware |
 | Rapier's spring joints produce unstable soft bodies | Gameplay feel broken | Medium | Tune spring constants carefully; fall back to rigid bodies with vertex deformation shader only |
 | WASM binary too large (>10 MB) | Slow page load | Low | No heavy dependencies; `wasm-opt`, LTO, no debug symbols in release |
-| Pressure Jacobi solver doesn't converge in 20 iterations | Visual artifacts in fluid | Medium | Pre-condition with Red-Black Gauss-Seidel ordering if Jacobi is insufficient; or increase to 30 and accept perf cost |
+| Pressure Jacobi solver doesn't converge in 20 iterations | Visual artifacts in fluid | Medium | N/A — replaced by LBM which has no iterative solve. LBM stability depends on τ staying above 0.5 and Mach number staying low (velocity << c_s). Clamp injection density to prevent supersonic flow |
 | GPU buffer limits hit on low-end devices | Crash on init | Low | Query `maxStorageBufferBindingSize`, scale particle pool and grid accordingly |
 | Moving boundary sweep fill too coarse at low grid resolution | Gas compression effect invisible — fluid teleports through obstacles | Medium | Increase grid resolution in the gap region or use sub-step obstacle rasterization (rasterize at 2× physics rate). Also scale obstacle velocity multiplier to compensate |
 | Cross-platform determinism needed for replays | Feature scope creep | Low | Use Rapier `enhanced-determinism` from day one; defer replay system |
 
 ---
 
-## 10. Open Design Questions
+## 10. Resolved Design Decisions
 
-1. **How many colors?** The original had 5. More colors = more density channels = more GPU memory. With RGBA packing, 4 fit in one texture. 5–8 need two textures. Decision: start with 4 (one texture), add a second if more are needed.
+1. **Color count**: Minimum 5 (matching the original), configurable by difficulty setting. Higher difficulty adds more colors. The LBM architecture imposes no limit — each additional color is just one passive scalar field (~256 KB at 256²) and one advection dispatch per frame.
 
-2. **Chain reactions**: When cleared blocks cause others to fall and form new matches, should each chain level escalate the visual effects? Proposed: yes — each chain level multiplies `velocity_burst_strength` and `particle_count` by a scaling factor, creating escalating spectacle.
+2. **Chain reactions**: Yes. Each chain level multiplies `lbm_density_inject` and `particle_count` by a scaling factor, creating escalating pressure waves and spectacle.
 
-3. **Persistent ambient smoke**: Should there always be a low-level ambient haze in the play field, or only event-driven smoke? Proposed: thin ambient density injection at the bottom of the screen (rising heat-haze effect) so the fluid sim always has something visible, even before any clears happen.
+3. **Persistent ambient smoke**: Configurable. Implement thin ambient density injection (rising heat-haze) as a toggle. When enabled, the fluid sim always has something visible even before any clears happen. When disabled, smoke only appears from destruction events.
 
-4. **Piece preview**: The original showed the next piece. Should the preview also have fluid effects? Proposed: no — keep the preview clean as a UI element. Focus GPU budget on the main board.
+## 11. Open Design Questions
 
-5. **Multiplayer**: Out of scope for this plan. The architecture supports it (game state is deterministic and serializable) but the networking layer, matchmaking, and split-screen rendering are separate projects.
+1. **Piece preview**: The original showed the next piece. Should the preview also have fluid effects? Proposed: no — keep the preview clean as a UI element. Focus GPU budget on the main board.
+
+2. **Multiplayer**: Out of scope for this plan. The architecture supports it (game state is deterministic and serializable) but the networking layer, matchmaking, and split-screen rendering are separate projects.
+
+---
+
+## 12. Glossary
+
+**Advection** — The transport of a quantity (like smoke density) by a velocity field. "Advect the density" means moving the smoke according to how the fluid is flowing.
+
+**BGK (Bhatnagar-Gross-Krook)** — The collision model used in the LBM solver. Each cell's distributions relax toward an equilibrium state at a rate controlled by the relaxation time τ. Named after the three physicists who proposed it.
+
+**Bind group** — A wgpu concept: a collection of GPU resources (buffers, textures, samplers) bound together and made accessible to a shader at a specific slot. Defined by a bind group layout.
+
+**Bounce-back** — The boundary condition scheme used in LBM for solid walls. Distributions hitting a solid cell are reflected back in the opposite direction. "Moving bounce-back" adds a velocity correction so that moving walls transfer momentum to the fluid.
+
+**Collision (LBM)** — The step where each cell's distributions are relaxed toward equilibrium. This is where viscosity, forces, and pressure behavior are determined. Purely local — each cell only reads its own data.
+
+**Compute shader** — A GPU program that runs general-purpose computation (not rendering). Used here for the LBM solver, particle updates, and density advection. Written in WGSL for WebGPU.
+
+**D2Q9** — The lattice configuration for 2D LBM: 2 dimensions, 9 velocity directions (center + 4 cardinal + 4 diagonal). Each cell stores 9 distribution values.
+
+**Dispatch** — Launching a compute shader on the GPU. You specify how many workgroups to run; each workgroup contains a fixed number of threads.
+
+**Distribution function (f_i)** — In LBM, the probability of finding a particle moving in direction `i` at a given cell. The 9 distributions per cell encode the fluid's density, velocity, and stress state. Not directly visible — macroscopic quantities are extracted from them.
+
+**Equilibrium distribution (f_i_eq)** — The distribution state a cell would have if the fluid were locally at rest (in thermodynamic equilibrium) at its current density and velocity. The collision step drives distributions toward this state.
+
+**Eulerian** — A simulation approach where the grid is fixed in space and the fluid moves through it. Both LBM and Stam's method are Eulerian. The alternative (Lagrangian) tracks individual fluid particles.
+
+**Instanced rendering** — Drawing many copies of the same mesh (e.g. a quad) in one draw call, with per-instance data (position, color, etc.) varying each copy. Used for blocks and particles.
+
+**Lattice Boltzmann Method (LBM)** — A fluid simulation technique based on kinetic theory rather than solving the Navier-Stokes equations directly. Fluid is modeled as distributions of fictitious particles on a discrete lattice. Collision and streaming steps recover correct macroscopic fluid behavior. Inherently compressible, non-iterative, and highly parallelizable.
+
+**Macroscopic quantities** — Density (ρ) and velocity (u) — the human-scale fluid properties extracted from the LBM distributions by summing them. These are what you actually see and what particles interact with.
+
+**Passive scalar** — A quantity carried by the fluid that doesn't affect the fluid's motion. The colored smoke densities are passive scalars — they ride the velocity field but don't change it. Contrast with the LBM fluid density (ρ), which directly determines pressure and drives flow.
+
+**Ping-pong** — A double-buffering technique where you alternate reading from buffer A and writing to buffer B, then swap roles next frame. Avoids read-write hazards on the GPU. Used for the LBM distribution buffers.
+
+**Pull scheme** — A streaming implementation where each cell reads distributions from its neighbors (pulling data inward). The alternative "push scheme" has each cell write to its neighbors. Pull is simpler for boundary handling.
+
+**Relaxation time (τ)** — The LBM parameter controlling how fast distributions approach equilibrium. Directly determines kinematic viscosity: `ν = (1/3)(τ - 0.5)`. Lower τ → less viscous, more turbulent. Must stay above 0.5 for stability.
+
+**Semi-Lagrangian advection** — A technique for moving a field through a velocity field: for each cell, trace backward along the velocity to find where the material came from, then interpolate. Used here only for the passive color densities, not the LBM itself.
+
+**Storage buffer** — A GPU buffer that compute shaders can read from and write to. Unlike uniform buffers, storage buffers can be large and support random access. Used for LBM distributions, particles, and color densities.
+
+**Streaming (LBM)** — The step where each distribution is shifted to its neighboring cell along its lattice direction. This propagates information (pressure waves, momentum) through the grid. Combined with collision, it produces correct fluid dynamics.
+
+**Sweep fill** — When rasterizing the obstacle texture, filling not just the body's current position but all cells between the previous and current positions. Prevents fast-moving objects from tunneling through the fluid grid between frames.
+
+**Trimino** — A game piece made of three connected cells (the Triptych equivalent of a Tetris tetromino). Each cell has a color. Cells can be individually destroyed when matched.
+
+**Workgroup** — A group of GPU threads that execute together and can share local memory. WebGPU limits apply per-workgroup. This project uses 8×8 = 64 threads per workgroup, the recommended default for WebGPU portability.
+
+**WGSL (WebGPU Shading Language)** — The shader language for WebGPU. Syntactically similar to Rust. All shaders in this project are WGSL — it's the only option when targeting the browser via wgpu.
+
+**wgpu** — A Rust library that provides a safe, cross-platform GPU abstraction based on the WebGPU standard. Runs natively on Vulkan/Metal/DX12 and in the browser via WebAssembly + WebGPU.
