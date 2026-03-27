@@ -1,0 +1,17 @@
+[package]
+name = "webtych-game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rapier2d = { version = "0.22", features = ["enhanced-determinism"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+rand = "0.8"
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+approx = "0.5"

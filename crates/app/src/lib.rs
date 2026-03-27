@@ -5,10 +5,12 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
 use renderer::Renderer;
+use webtych_game::{GameState, InputAction};
 
 // On WASM the GPU init is async; we hand a shared slot to spawn_local
 // and poll it from the event handler until it's ready.
@@ -18,6 +20,12 @@ use std::{cell::RefCell, rc::Rc};
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    game_state: Option<GameState>,
+    input_buffer: Vec<InputAction>,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_instant: Option<std::time::Instant>,
+    #[cfg(target_arch = "wasm32")]
+    last_time_ms: Option<f64>,
     #[cfg(target_arch = "wasm32")]
     pending: Rc<RefCell<Option<Renderer>>>,
 }
@@ -27,9 +35,55 @@ impl App {
         Self {
             window: None,
             renderer: None,
+            game_state: None,
+            input_buffer: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            last_instant: None,
+            #[cfg(target_arch = "wasm32")]
+            last_time_ms: None,
             #[cfg(target_arch = "wasm32")]
             pending: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Compute delta time since last frame.
+    fn delta_time(&mut self) -> f32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = std::time::Instant::now();
+            let dt = self
+                .last_instant
+                .map(|prev| now.duration_since(prev).as_secs_f32())
+                .unwrap_or(1.0 / 60.0);
+            self.last_instant = Some(now);
+            dt
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let now = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(0.0);
+            let dt = self
+                .last_time_ms
+                .map(|prev| ((now - prev) / 1000.0) as f32)
+                .unwrap_or(1.0 / 60.0);
+            self.last_time_ms = Some(now);
+            dt
+        }
+    }
+}
+
+/// Map winit key codes to game input actions.
+fn map_key(key: KeyCode) -> Option<InputAction> {
+    match key {
+        KeyCode::ArrowLeft | KeyCode::KeyA => Some(InputAction::MoveLeft),
+        KeyCode::ArrowRight | KeyCode::KeyD => Some(InputAction::MoveRight),
+        KeyCode::ArrowUp | KeyCode::KeyW => Some(InputAction::RotateCW),
+        KeyCode::KeyZ => Some(InputAction::RotateCCW),
+        KeyCode::ArrowDown | KeyCode::KeyS => Some(InputAction::SoftDrop),
+        KeyCode::Space => Some(InputAction::HardDrop),
+        _ => None,
     }
 }
 
@@ -76,6 +130,7 @@ impl ApplicationHandler for App {
             });
         }
 
+        self.game_state = Some(GameState::new());
         self.window = Some(window);
     }
 
@@ -93,14 +148,39 @@ impl ApplicationHandler for App {
             }
         }
 
-        let (Some(window), Some(renderer)) =
-            (self.window.as_ref(), self.renderer.as_mut())
-        else {
-            // Request another frame while waiting for GPU init.
-            if let WindowEvent::RedrawRequested = event {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+        match event {
+            WindowEvent::Resized(_)
+            | WindowEvent::RedrawRequested
+            | WindowEvent::CloseRequested => {}
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == winit::event::ElementState::Pressed && !event.repeat {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        if let Some(action) = map_key(code) {
+                            self.input_buffer.push(action);
+                        }
+                    }
                 }
+                return;
+            }
+            _ => return,
+        }
+
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        // Compute dt and drain inputs before borrowing renderer.
+        if matches!(event, WindowEvent::RedrawRequested) {
+            let dt = self.delta_time();
+            let inputs: Vec<InputAction> = self.input_buffer.drain(..).collect();
+            if let Some(game) = self.game_state.as_mut() {
+                game.update(dt, &inputs);
+            }
+        }
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            if matches!(event, WindowEvent::RedrawRequested) {
+                window.request_redraw();
             }
             return;
         };
@@ -110,15 +190,15 @@ impl ApplicationHandler for App {
                 renderer.resize(size);
             }
             WindowEvent::RedrawRequested => {
-                renderer.update();
+                if let Some(game) = self.game_state.as_ref() {
+                    let instances = game.block_instances();
+                    renderer.update_instances(&instances);
+                }
+
                 match renderer.render() {
                     Ok(_) => {}
                     Err(renderer::RenderError::Reconfigure) => {
                         renderer.resize(window.inner_size());
-                    }
-                    Err(renderer::RenderError::Fatal) => {
-                        log::error!("Unrecoverable render error — exiting");
-                        event_loop.exit();
                     }
                 }
                 window.request_redraw();
