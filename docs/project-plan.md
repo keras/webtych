@@ -502,12 +502,12 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 **Goal**: Window opens, wgpu renders a colored triangle, builds and runs in both native and WASM.
 
-- [ ] Workspace setup: `game`, `gpu`, `app` crates.
-- [ ] `winit` event loop with platform-conditional init (native vs WASM).
-- [ ] `wgpu` context creation, surface configuration.
-- [ ] Basic render pass: clear screen + hardcoded triangle.
-- [ ] Trunk build config, verify WASM runs in Chrome.
-- [ ] CI: build both targets (native + wasm).
+- [x] Workspace setup: `game`, `gpu`, `app` crates.
+- [x] `winit` event loop with platform-conditional init (native vs WASM).
+- [x] `wgpu` context creation, surface configuration.
+- [x] Basic render pass: clear screen + hardcoded triangle.
+- [x] Trunk build config, verify WASM runs in Chrome.
+- [x] CI: build both targets (native + wasm).
 
 ### Phase 1 — Core Game Loop (2–3 weeks)
 
