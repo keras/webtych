@@ -498,7 +498,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 ## 8. Implementation Phases
 
-### Phase 0 — Scaffolding (1–2 weeks)
+### Phase 0 — Scaffolding
 
 **Goal**: Window opens, wgpu renders a colored triangle, builds and runs in both native and WASM.
 
@@ -509,7 +509,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [x] Trunk build config, verify WASM runs in Chrome.
 - [x] CI: build both targets (native + wasm).
 
-### Phase 1 — Core Game Loop (2–3 weeks)
+### Phase 1 — Core Game Loop
 
 **Goal**: Triminos fall, stack, and clear. No visual effects. Blocks are flat colored quads.
 
@@ -523,7 +523,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Game over detection (stack reaches top).
 - [ ] Instanced block rendering on GPU — flat color, no deformation yet.
 
-### Phase 2 — Soft Body Deformation (1–2 weeks)
+### Phase 2 — Soft Body Deformation
 
 **Goal**: Blocks visually squish and bounce. The "jello" feel.
 
@@ -548,7 +548,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Smoke render pass: full-screen quad sampling density.
 - [ ] Performance profiling on WASM — tune grid size and iteration count.
 
-### Phase 4 — Destruction Effects (2 weeks)
+### Phase 4 — Destruction Effects
 
 **Goal**: Clearing blocks produces per-color smoke and particle explosions.
 
@@ -560,7 +560,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Per-color effect profiles: define 4–6 color schemes.
 - [ ] Block dissolve shader: noise erosion keyed on `destroy_progress`.
 
-### Phase 5 — Fluid–Physics Integration & Particle Coupling (1–2 weeks)
+### Phase 5 — Fluid–Physics Integration & Particle Coupling
 
 **Goal**: Gas visibly squeezes between closing blocks via the moving boundary system. Particles drift in smoke.
 
@@ -571,7 +571,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Tune coupling strength per effect type (smoke particles: high coupling, sparks: low coupling).
 - [ ] Stress test: rapid chain clears + fast drops, verify fluid stays stable and performance holds.
 
-### Phase 6 — Post-Processing & Polish (2 weeks)
+### Phase 6 — Post-Processing & Polish
 
 **Goal**: Bloom, distortion, screen shake. The game looks finished.
 
@@ -583,7 +583,7 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 - [ ] Ambient background: subtle parallax grid or gradient.
 - [ ] UI: score display, level, next piece preview (simple text or quads).
 
-### Phase 7 — Optimization & Shipping (2 weeks)
+### Phase 7 — Optimization & Shipping
 
 **Goal**: Stable 60 FPS on mid-range hardware in Chrome. Polished release.
 
