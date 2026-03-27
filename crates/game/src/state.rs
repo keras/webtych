@@ -36,8 +36,8 @@ pub enum GamePhase {
 
 /// Tunable constants for the game feel.
 const BASE_DROP_INTERVAL: f32 = 1.0; // seconds between auto-drops at level 1
-const SETTLE_TIME: f32 = 0.4; // seconds to wait after landing before checking
-const CLEARING_SETTLE_TIME: f32 = 0.6; // seconds to wait after clearing before re-check
+const SETTLE_TIME: f32 = 0.5; // seconds to wait after landing before checking (extra time for spring oscillation)
+const CLEARING_SETTLE_TIME: f32 = 0.7; // seconds to wait after clearing before re-check
 const MOVE_IMPULSE: f32 = 5.0;
 const ROTATION_IMPULSE: f32 = 3.0;
 const SOFT_DROP_IMPULSE: f32 = -8.0;
@@ -125,7 +125,10 @@ impl GameState {
 
     fn phase_spawning(&mut self) {
         // Check game over: any settled cell above the board.
-        if self.physics.any_cell_above(&self.board, SETTLE_VELOCITY_THRESHOLD) {
+        if self
+            .physics
+            .any_cell_above(&self.board, SETTLE_VELOCITY_THRESHOLD)
+        {
             self.phase = GamePhase::GameOver;
             self.events.push(GameEvent::GameOver);
             return;
@@ -139,7 +142,7 @@ impl GameState {
 
         self.events.push(GameEvent::Spawn {
             shape: descriptor.shape,
-            color: descriptor.color,
+            colors: descriptor.colors,
         });
 
         self.phase = GamePhase::Falling;
@@ -172,11 +175,12 @@ impl GameState {
                     self.physics.apply_down_impulse(piece_id, SOFT_DROP_IMPULSE);
                 }
                 InputAction::HardDrop => {
-                    self.physics.apply_down_impulse(piece_id, HARD_DROP_VELOCITY);
+                    self.physics
+                        .apply_down_impulse(piece_id, HARD_DROP_VELOCITY);
                     // Immediately transition to settling.
+                    // Springs remain attached — wobble on impact is the point.
                     self.settle_timer = 0.0;
                     self.phase = GamePhase::Settling;
-                    self.physics.detach_piece(piece_id);
                     return;
                 }
             }
@@ -190,7 +194,10 @@ impl GameState {
         }
 
         // Detect if piece has come to rest (contact with something below + low velocity).
-        if self.physics.is_piece_settled(piece_id, SETTLE_VELOCITY_THRESHOLD) {
+        if self
+            .physics
+            .is_piece_settled(piece_id, SETTLE_VELOCITY_THRESHOLD)
+        {
             // Check that the piece is actually resting on something
             // (not just momentarily slow at the peak of a bounce).
             // We do this by checking if the piece y-velocity is near zero or negative.
@@ -198,18 +205,14 @@ impl GameState {
             if let Some(handles) = handles {
                 let avg_y_vel: f32 = handles
                     .iter()
-                    .filter_map(|&h| {
-                        self.physics
-                            .bodies()
-                            .get(h)
-                            .map(|b| b.linvel().y)
-                    })
+                    .filter_map(|&h| self.physics.bodies().get(h).map(|b| b.linvel().y))
                     .sum::<f32>()
                     / handles.len() as f32;
 
                 if avg_y_vel <= 0.5 {
                     self.detect_impacts(piece_id);
-                    self.physics.detach_piece(piece_id);
+                    // Springs remain attached — they produce wobble on impact
+                    // and are only removed when cells are destroyed.
                     self.settle_timer = 0.0;
                     self.phase = GamePhase::Settling;
                 }
@@ -220,9 +223,7 @@ impl GameState {
     fn phase_settling(&mut self, dt: f32) {
         self.settle_timer += dt;
         if self.settle_timer >= SETTLE_TIME
-            && self
-                .physics
-                .is_world_settled(SETTLE_VELOCITY_THRESHOLD)
+            && self.physics.is_world_settled(SETTLE_VELOCITY_THRESHOLD)
         {
             self.phase = GamePhase::Checking;
         }
@@ -279,9 +280,7 @@ impl GameState {
     fn phase_clearing(&mut self, dt: f32) {
         self.settle_timer += dt;
         if self.settle_timer >= CLEARING_SETTLE_TIME
-            && self
-                .physics
-                .is_world_settled(SETTLE_VELOCITY_THRESHOLD)
+            && self.physics.is_world_settled(SETTLE_VELOCITY_THRESHOLD)
         {
             // Re-check for chain reactions.
             self.phase = GamePhase::Checking;

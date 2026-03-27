@@ -21,7 +21,7 @@ pub enum GameEvent {
     /// A new piece was spawned.
     Spawn {
         shape: TriminoShape,
-        color: Color,
+        colors: [Color; 3],
     },
     /// Player reached a new level.
     LevelUp { level: u32 },

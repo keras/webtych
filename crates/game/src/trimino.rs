@@ -77,52 +77,60 @@ fn rotate_90_cw(v: Vec2, steps: u8) -> Vec2 {
     }
 }
 
-/// A piece to be spawned: shape + color + rotation.
+/// A piece to be spawned: shape + per-cell colors + rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieceDescriptor {
     pub shape: TriminoShape,
-    pub color: Color,
+    /// Each of the 3 cells gets its own color.
+    pub colors: [Color; 3],
     pub rotation: u8,
 }
 
-/// 7-bag–style randomizer: generates all shape×color combos, shuffles, deals.
-/// When the bag is empty, refill and reshuffle.
+/// Randomizer that generates pieces with random shapes and per-cell random colors.
 pub struct PieceBag {
-    bag: Vec<PieceDescriptor>,
+    shapes: Vec<TriminoShape>,
 }
 
 impl PieceBag {
     pub fn new<R: Rng>(rng: &mut R) -> Self {
-        let mut bag = Self { bag: Vec::new() };
+        let mut bag = Self {
+            shapes: Vec::new(),
+        };
         bag.refill(rng);
         bag
     }
 
     /// Draw the next piece from the bag. Refills automatically when empty.
     pub fn next<R: Rng>(&mut self, rng: &mut R) -> PieceDescriptor {
-        if self.bag.is_empty() {
+        if self.shapes.is_empty() {
             self.refill(rng);
         }
-        self.bag.pop().expect("bag was just refilled")
+        let shape = self.shapes.pop().expect("bag was just refilled");
+        let colors = [
+            *Color::ALL.choose(rng).unwrap(),
+            *Color::ALL.choose(rng).unwrap(),
+            *Color::ALL.choose(rng).unwrap(),
+        ];
+        PieceDescriptor {
+            shape,
+            colors,
+            rotation: 0,
+        }
     }
 
-    /// Peek at the next piece without consuming it.
-    pub fn peek(&self) -> Option<&PieceDescriptor> {
-        self.bag.last()
+    /// Peek at the next shape (color is random on draw, so not available).
+    pub fn peek_shape(&self) -> Option<&TriminoShape> {
+        self.shapes.last()
     }
 
     fn refill<R: Rng>(&mut self, rng: &mut R) {
-        self.bag.clear();
+        self.shapes.clear();
+        // Two copies of each shape for a balanced bag.
         for &shape in &TriminoShape::ALL {
-            for &color in &Color::ALL {
-                self.bag.push(PieceDescriptor {
-                    shape,
-                    color,
-                    rotation: 0,
-                });
-            }
+            self.shapes.push(shape);
+            self.shapes.push(shape);
         }
-        self.bag.shuffle(rng);
+        self.shapes.shuffle(rng);
     }
 }
 
@@ -167,25 +175,30 @@ mod tests {
     }
 
     #[test]
-    fn piece_bag_yields_all_combos() {
+    fn piece_bag_yields_all_shapes() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
-        let total = TriminoShape::ALL.len() * Color::ALL.len(); // 12
-
+        // Bag has 2 copies of each shape = 6 pieces.
         let mut pieces = Vec::new();
-        for _ in 0..total {
+        for _ in 0..6 {
             pieces.push(bag.next(&mut rng));
         }
 
-        // Every shape×color combination should appear exactly once.
+        // Every shape should appear exactly twice.
         for &shape in &TriminoShape::ALL {
-            for &color in &Color::ALL {
-                let count = pieces
-                    .iter()
-                    .filter(|p| p.shape == shape && p.color == color)
-                    .count();
-                assert_eq!(count, 1, "Expected exactly one {:?}/{:?}", shape, color);
-            }
+            let count = pieces.iter().filter(|p| p.shape == shape).count();
+            assert_eq!(count, 2, "Expected two {:?} pieces in bag", shape);
+        }
+    }
+
+    #[test]
+    fn piece_bag_per_cell_colors() {
+        let mut rng = rand::thread_rng();
+        let mut bag = PieceBag::new(&mut rng);
+        let piece = bag.next(&mut rng);
+        // Each cell should have a valid color.
+        for color in &piece.colors {
+            assert!(Color::ALL.contains(color));
         }
     }
 
@@ -194,18 +207,17 @@ mod tests {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
         // Draw more than one bag's worth.
-        let total = TriminoShape::ALL.len() * Color::ALL.len();
-        for _ in 0..total + 5 {
+        for _ in 0..20 {
             let _ = bag.next(&mut rng);
         }
     }
 
     #[test]
-    fn peek_returns_next_without_consuming() {
+    fn peek_shape_returns_next_without_consuming() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
-        let peeked = *bag.peek().unwrap();
+        let peeked_shape = *bag.peek_shape().unwrap();
         let drawn = bag.next(&mut rng);
-        assert_eq!(peeked, drawn);
+        assert_eq!(peeked_shape, drawn.shape);
     }
 }

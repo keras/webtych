@@ -54,6 +54,15 @@ pub struct CellInfo {
     pub linvel: Vec2,
 }
 
+/// Spring-damper joint parameters for connecting trimino cells.
+/// Cells flex and wobble on impact, producing a bouncy "jello" feel.
+/// Using AccelerationBased model so spring behavior is mass-independent.
+const SPRING_STIFFNESS: f32 = 8000.0; // high stiffness keeps cells visually connected
+const SPRING_DAMPING: f32 = 120.0; // enough damping to settle wobble within ~0.3s
+
+/// Maximum distance between cell centers (in cell-size units) to be considered adjacent.
+const ADJACENCY_THRESHOLD: f32 = 1.1;
+
 /// Wraps the Rapier2D physics pipeline and body sets.
 pub struct PhysicsWorld {
     bodies: RigidBodySet,
@@ -159,12 +168,12 @@ impl PhysicsWorld {
         self.next_piece_id += 1;
 
         let offsets = descriptor.shape.offsets(descriptor.rotation);
-        let user_data = pack_user_data(descriptor.color, piece_id);
         let half_cell = crate::board::CELL_SIZE / 2.0 * 0.95; // slight gap for visual clarity
 
         let mut handles = Vec::with_capacity(3);
-        for offset in &offsets {
+        for (idx, offset) in offsets.iter().enumerate() {
             let pos = center + *offset * crate::board::CELL_SIZE;
+            let user_data = pack_user_data(descriptor.colors[idx], piece_id);
             let body = self.bodies.insert(
                 RigidBodyBuilder::dynamic()
                     .translation(vector![pos.x, pos.y])
@@ -183,24 +192,60 @@ impl PhysicsWorld {
             handles.push(body);
         }
 
-        // Connect cells with fixed joints.
+        // Connect adjacent cells with 4 spring-damper joints per pair:
+        // 2 perpendicular (corner-to-corner across shared edge) +
+        // 2 crossing (corner-to-opposite-corner), resisting both translation and rotation.
         let mut joint_handles = Vec::new();
-        for i in 1..handles.len() {
-            let anchor_a = handles[0];
-            let anchor_b = handles[i];
+        let cell_size = crate::board::CELL_SIZE;
+        for i in 0..handles.len() {
+            for j in (i + 1)..handles.len() {
+                let pos_i = self.body_position(handles[i]);
+                let pos_j = self.body_position(handles[j]);
+                let dist = (pos_j - pos_i).length();
 
-            let pos_a = self.body_position(anchor_a);
-            let pos_b = self.body_position(anchor_b);
-            let diff = pos_b - pos_a;
+                if dist <= cell_size * ADJACENCY_THRESHOLD {
+                    let diff = pos_j - pos_i;
+                    let dir = diff.normalize();
+                    let perp = Vec2::new(-dir.y, dir.x);
 
-            let joint = FixedJointBuilder::new()
-                .local_anchor1(point![diff.x, diff.y])
-                .local_anchor2(point![0.0, 0.0]);
+                    // Corner anchors on each cell's shared edge (in local frame).
+                    let i_corner_p = dir * half_cell + perp * half_cell;
+                    let i_corner_m = dir * half_cell - perp * half_cell;
+                    let j_corner_p = -dir * half_cell + perp * half_cell;
+                    let j_corner_m = -dir * half_cell - perp * half_cell;
 
-            let jh = self
-                .joints
-                .insert(anchor_a, anchor_b, joint, true);
-            joint_handles.push(jh);
+                    // Rest lengths: distance between anchor pairs in equilibrium.
+                    let gap = cell_size - 2.0 * half_cell;
+                    let perp_rest = gap;
+                    let cross_rest = (gap * gap + (2.0 * half_cell).powi(2)).sqrt();
+
+                    // Helper to insert one spring joint.
+                    let mut add_spring =
+                        |a1: Vec2, a2: Vec2, rest: f32| {
+                            let joint = SpringJointBuilder::new(
+                                rest,
+                                SPRING_STIFFNESS,
+                                SPRING_DAMPING,
+                            )
+                            .local_anchor1(point![a1.x, a1.y])
+                            .local_anchor2(point![a2.x, a2.y])
+                            .spring_model(MotorModel::AccelerationBased);
+
+                            let jh =
+                                self.joints
+                                    .insert(handles[i], handles[j], joint, true);
+                            joint_handles.push(jh);
+                        };
+
+                    // 2 perpendicular springs (straight across shared edge).
+                    add_spring(i_corner_p, j_corner_p, perp_rest);
+                    add_spring(i_corner_m, j_corner_m, perp_rest);
+
+                    // 2 crossing springs (diagonal).
+                    add_spring(i_corner_p, j_corner_m, cross_rest);
+                    add_spring(i_corner_m, j_corner_p, cross_rest);
+                }
+            }
         }
 
         self.piece_cells.push((piece_id, handles.clone()));
@@ -212,11 +257,7 @@ impl PhysicsWorld {
     /// Detach a piece's cells so they become independent bodies.
     /// Removes the joints connecting them.
     pub fn detach_piece(&mut self, piece_id: PieceId) {
-        if let Some(idx) = self
-            .piece_joints
-            .iter()
-            .position(|(id, _)| *id == piece_id)
-        {
+        if let Some(idx) = self.piece_joints.iter().position(|(id, _)| *id == piece_id) {
             let (_, joint_handles) = self.piece_joints.remove(idx);
             for jh in joint_handles {
                 self.joints.remove(jh, true);
@@ -225,6 +266,7 @@ impl PhysicsWorld {
     }
 
     /// Remove a single cell body from the world.
+    /// Rapier automatically removes attached joints; we clean up our tracking.
     pub fn remove_body(&mut self, handle: RigidBodyHandle) {
         self.bodies.remove(
             handle,
@@ -237,6 +279,11 @@ impl PhysicsWorld {
         // Clean up from piece_cells tracking.
         for (_, cells) in &mut self.piece_cells {
             cells.retain(|h| *h != handle);
+        }
+        // Clean up stale joint handles (Rapier already removed them,
+        // but our tracking still references them).
+        for (_, joints) in &mut self.piece_joints {
+            joints.retain(|jh| self.joints.get(*jh).is_some());
         }
     }
 
@@ -441,7 +488,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            color: Color::Red,
+            colors: [Color::Red; 3],
             rotation: 0,
         };
         let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
@@ -454,7 +501,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::L,
-            color: Color::Blue,
+            colors: [Color::Blue; 3],
             rotation: 0,
         };
         let (piece_id, _) = world.spawn_piece(&desc, board.spawn_position());
@@ -475,7 +522,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::T,
-            color: Color::Green,
+            colors: [Color::Green; 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
@@ -489,7 +536,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            color: Color::Yellow,
+            colors: [Color::Yellow; 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
@@ -504,7 +551,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            color: Color::Red,
+            colors: [Color::Red; 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
@@ -519,7 +566,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            color: Color::Red,
+            colors: [Color::Red; 3],
             rotation: 0,
         };
         let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
@@ -527,5 +574,72 @@ mod tests {
         world.remove_body(to_remove);
         let infos = world.cell_infos();
         assert_eq!(infos.len(), 2);
+    }
+
+    #[test]
+    fn spring_joints_pull_displaced_cells_back() {
+        // Spawn an I-piece in zero gravity, displace one cell, and verify
+        // the spring pulls it back toward its rest position.
+        let board = Board::default();
+        let mut world = PhysicsWorld::new(&board);
+        // Disable gravity so we measure spring force in isolation.
+        world.gravity = vector![0.0, 0.0];
+
+        let desc = PieceDescriptor {
+            shape: TriminoShape::I,
+            colors: [Color::Red; 3],
+            rotation: 0,
+        };
+        let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
+
+        // Record initial position of cell 2 (rightmost).
+        let initial_pos = world.body_position(handles[2]);
+
+        // Displace cell 2 to the right by 2 units.
+        if let Some(body) = world.bodies.get_mut(handles[2]) {
+            let t = body.translation();
+            body.set_translation(vector![t.x + 2.0, t.y], true);
+        }
+        let displaced_pos = world.body_position(handles[2]);
+        assert!((displaced_pos.x - initial_pos.x - 2.0).abs() < 0.01);
+
+        // Step physics — the spring should pull cell 2 back.
+        for _ in 0..120 {
+            world.step(1.0 / 60.0);
+        }
+
+        let final_pos = world.body_position(handles[2]);
+        let recovery = (displaced_pos.x - final_pos.x).abs();
+        assert!(
+            recovery > 0.5,
+            "Spring should pull displaced cell back significantly. \
+             Displaced: {:.2}, Final: {:.2}, Recovery: {:.2}",
+            displaced_pos.x,
+            final_pos.x,
+            recovery,
+        );
+    }
+
+    #[test]
+    fn spring_joints_are_created_for_adjacent_cells() {
+        let board = Board::default();
+        let mut world = PhysicsWorld::new(&board);
+        let desc = PieceDescriptor {
+            shape: TriminoShape::I,
+            colors: [Color::Red; 3],
+            rotation: 0,
+        };
+        let (piece_id, _) = world.spawn_piece(&desc, board.spawn_position());
+
+        // I-shape has 3 cells in a line. Cells 0-1 and 1-2 are adjacent (distance 1.0),
+        // but 0-2 are not (distance 2.0). So we expect 2 pairs × 4 springs = 8 joints.
+        let joints = world.piece_joints.iter().find(|(id, _)| *id == piece_id);
+        assert!(joints.is_some());
+        let (_, joint_handles) = joints.unwrap();
+        assert_eq!(
+            joint_handles.len(),
+            8,
+            "I-shape should have 8 spring joints (4 per adjacent pair)"
+        );
     }
 }

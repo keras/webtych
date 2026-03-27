@@ -586,11 +586,11 @@ No heavy asset pipeline — the game is procedurally rendered. If particle sprit
 
 **Goal**: Blocks wobble and flex on impact. The trimino feels bouncy and alive.
 
-- [ ] Connect trimino cells with spring-damper joints at shared edges.
-- [ ] Tune spring stiffness and damping for satisfying wobble on impact.
-- [ ] Remove spring joints on cell destruction, let surviving cells separate or regroup.
-- [ ] Upload per-block position + rotation as instance data.
-- [ ] Block vertex shader: transform quad by position and rotation.
+- [x] Connect trimino cells with spring-damper joints at shared edges.
+- [x] Tune spring stiffness and damping for satisfying wobble on impact.
+- [x] Remove spring joints on cell destruction, let surviving cells separate or regroup.
+- [x] Upload per-block position + rotation as instance data.
+- [x] Block vertex shader: transform quad by position and rotation.
 
 ### Phase 3 — Fluid Simulation Foundation
 
