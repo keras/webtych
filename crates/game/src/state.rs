@@ -62,6 +62,12 @@ pub struct GameState {
     accumulator: f32,
 }
 
+impl Default for GameState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GameState {
     pub fn new() -> Self {
         let board = Board::default();
