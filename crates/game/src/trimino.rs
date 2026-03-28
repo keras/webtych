@@ -2,21 +2,73 @@ use glam::Vec2;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Block colors — 4 colors fit in one RGBA density texture.
+/// A color index referencing a slot in the active [`ColorPalette`].
+///
+/// The value is opaque — its meaning depends on the palette in use.
+/// Use `palette.rgba(color_id)` to resolve to an actual RGBA value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum Color {
-    Red = 0,
-    Blue = 1,
-    Green = 2,
-    Yellow = 3,
+pub struct ColorId(pub u32);
+
+impl ColorId {
+    pub fn id(self) -> u32 {
+        self.0
+    }
 }
 
-impl Color {
-    pub const ALL: [Color; 4] = [Color::Red, Color::Blue, Color::Green, Color::Yellow];
+/// A configurable color palette.
+///
+/// The default palette has 4 colors (Red, Blue, Green, Yellow).
+/// Higher difficulties can add more colors.
+#[derive(Debug, Clone)]
+pub struct ColorPalette {
+    /// RGBA values for each color slot.
+    colors: Vec<[f32; 4]>,
+}
 
-    pub fn id(self) -> u32 {
-        self as u32
+impl Default for ColorPalette {
+    fn default() -> Self {
+        Self {
+            colors: vec![
+                [0.90, 0.22, 0.22, 1.0], // red
+                [0.22, 0.42, 0.90, 1.0], // blue
+                [0.22, 0.80, 0.35, 1.0], // green
+                [0.92, 0.82, 0.12, 1.0], // yellow
+                [0.9, 0.82, 0.9, 1.0],   // light grey
+            ],
+        }
+    }
+}
+
+impl ColorPalette {
+    /// Create a palette from a list of RGBA colors.
+    pub fn new(colors: Vec<[f32; 4]>) -> Self {
+        assert!(!colors.is_empty(), "palette must have at least one color");
+        Self { colors }
+    }
+
+    /// Number of colors in the palette.
+    pub fn len(&self) -> u32 {
+        self.colors.len() as u32
+    }
+
+    /// Whether the palette is empty (always false after construction).
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
+    }
+
+    /// Get the RGBA value for a color index.
+    pub fn rgba(&self, id: ColorId) -> [f32; 4] {
+        self.colors[id.0 as usize % self.colors.len()]
+    }
+
+    /// Get all RGBA values (for uploading to the GPU as a uniform).
+    pub fn as_slice(&self) -> &[[f32; 4]] {
+        &self.colors
+    }
+
+    /// Return a random [`ColorId`] from this palette.
+    pub fn random_color<R: Rng>(&self, rng: &mut R) -> ColorId {
+        ColorId(rng.gen_range(0..self.len()))
     }
 }
 
@@ -82,7 +134,7 @@ fn rotate_90_cw(v: Vec2, steps: u8) -> Vec2 {
 pub struct PieceDescriptor {
     pub shape: TriminoShape,
     /// Each of the 3 cells gets its own color.
-    pub colors: [Color; 3],
+    pub colors: [ColorId; 3],
     pub rotation: u8,
 }
 
@@ -93,23 +145,22 @@ pub struct PieceBag {
 
 impl PieceBag {
     pub fn new<R: Rng>(rng: &mut R) -> Self {
-        let mut bag = Self {
-            shapes: Vec::new(),
-        };
+        let mut bag = Self { shapes: Vec::new() };
         bag.refill(rng);
         bag
     }
 
     /// Draw the next piece from the bag. Refills automatically when empty.
-    pub fn next<R: Rng>(&mut self, rng: &mut R) -> PieceDescriptor {
+    /// Colors are picked randomly from the given palette.
+    pub fn next<R: Rng>(&mut self, rng: &mut R, palette: &ColorPalette) -> PieceDescriptor {
         if self.shapes.is_empty() {
             self.refill(rng);
         }
         let shape = self.shapes.pop().expect("bag was just refilled");
         let colors = [
-            *Color::ALL.choose(rng).unwrap(),
-            *Color::ALL.choose(rng).unwrap(),
-            *Color::ALL.choose(rng).unwrap(),
+            palette.random_color(rng),
+            palette.random_color(rng),
+            palette.random_color(rng),
         ];
         PieceDescriptor {
             shape,
@@ -139,11 +190,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_ids_are_sequential() {
-        assert_eq!(Color::Red.id(), 0);
-        assert_eq!(Color::Blue.id(), 1);
-        assert_eq!(Color::Green.id(), 2);
-        assert_eq!(Color::Yellow.id(), 3);
+    fn color_palette_default_has_four_colors() {
+        let p = ColorPalette::default();
+        assert_eq!(p.len(), 4);
+    }
+
+    #[test]
+    fn color_id_roundtrip() {
+        assert_eq!(ColorId(0).id(), 0);
+        assert_eq!(ColorId(3).id(), 3);
+    }
+
+    #[test]
+    fn palette_rgba_wraps_on_overflow() {
+        let p = ColorPalette::default();
+        // Index 4 should wrap to 0.
+        assert_eq!(p.rgba(ColorId(4)), p.rgba(ColorId(0)));
     }
 
     #[test]
@@ -178,13 +240,12 @@ mod tests {
     fn piece_bag_yields_all_shapes() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
-        // Bag has 2 copies of each shape = 6 pieces.
+        let palette = ColorPalette::default();
         let mut pieces = Vec::new();
         for _ in 0..6 {
-            pieces.push(bag.next(&mut rng));
+            pieces.push(bag.next(&mut rng, &palette));
         }
 
-        // Every shape should appear exactly twice.
         for &shape in &TriminoShape::ALL {
             let count = pieces.iter().filter(|p| p.shape == shape).count();
             assert_eq!(count, 2, "Expected two {:?} pieces in bag", shape);
@@ -195,10 +256,10 @@ mod tests {
     fn piece_bag_per_cell_colors() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
-        let piece = bag.next(&mut rng);
-        // Each cell should have a valid color.
+        let palette = ColorPalette::default();
+        let piece = bag.next(&mut rng, &palette);
         for color in &piece.colors {
-            assert!(Color::ALL.contains(color));
+            assert!(color.id() < palette.len());
         }
     }
 
@@ -206,9 +267,9 @@ mod tests {
     fn piece_bag_auto_refills() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
-        // Draw more than one bag's worth.
+        let palette = ColorPalette::default();
         for _ in 0..20 {
-            let _ = bag.next(&mut rng);
+            let _ = bag.next(&mut rng, &palette);
         }
     }
 
@@ -216,8 +277,9 @@ mod tests {
     fn peek_shape_returns_next_without_consuming() {
         let mut rng = rand::thread_rng();
         let mut bag = PieceBag::new(&mut rng);
+        let palette = ColorPalette::default();
         let peeked_shape = *bag.peek_shape().unwrap();
-        let drawn = bag.next(&mut rng);
+        let drawn = bag.next(&mut rng, &palette);
         assert_eq!(peeked_shape, drawn.shape);
     }
 }

@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rapier2d::prelude::*;
 
 use crate::physics::PhysicsWorld;
-use crate::trimino::Color;
+use crate::trimino::ColorId;
 
 /// A group of same-color cells that are in mutual contact (match ≥ 3).
 #[derive(Debug, Clone)]
 pub struct MatchGroup {
-    pub color: Color,
+    pub color: ColorId,
     pub handles: Vec<RigidBodyHandle>,
 }
 
@@ -28,7 +28,7 @@ pub fn detect_matches(physics: &PhysicsWorld) -> Vec<MatchGroup> {
     // Adjacency: body_handle → set of adjacent same-color body handles.
     let mut adjacency: HashMap<RigidBodyHandle, HashSet<RigidBodyHandle>> = HashMap::new();
     // Track color per body handle.
-    let mut body_colors: HashMap<RigidBodyHandle, Color> = HashMap::new();
+    let mut body_colors: HashMap<RigidBodyHandle, ColorId> = HashMap::new();
 
     narrow.contact_pairs().for_each(|pair| {
         if !pair.has_any_active_contact {

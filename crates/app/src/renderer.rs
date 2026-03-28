@@ -3,6 +3,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use webtych_game::physics::BlockInstance;
+use webtych_game::ColorPalette;
 
 // ── WGSL shader ───────────────────────────────────────────────────────────────
 
@@ -12,17 +13,19 @@ struct Camera {
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
 
+struct Palette {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    colors: array<vec4<f32>, 16>,
+}
+@group(0) @binding(1) var<uniform> palette: Palette;
+
 struct VOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
 }
-
-const COLORS = array<vec4<f32>, 4>(
-    vec4<f32>(0.90, 0.22, 0.22, 1.0),   // red
-    vec4<f32>(0.22, 0.42, 0.90, 1.0),   // blue
-    vec4<f32>(0.22, 0.80, 0.35, 1.0),   // green
-    vec4<f32>(0.92, 0.82, 0.12, 1.0),   // yellow
-);
 
 @vertex
 fn vs_main(
@@ -49,8 +52,8 @@ fn vs_main(
     var out: VOut;
     out.clip_pos = camera.projection * vec4<f32>(world_pos, 0.0, 1.0);
 
-    let idx = min(inst_color_id, 3u);
-    var base_color = COLORS[idx];
+    let idx = min(inst_color_id, palette.count - 1u);
+    var base_color = palette.colors[idx];
 
     // Dim the block slightly if it's being destroyed.
     if inst_alive == 0u {
@@ -117,6 +120,35 @@ const QUAD_VERTICES: &[Vertex] = &[
 
 const QUAD_INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 
+// ── Palette GPU layout ──────────────────────────────────────────────────────
+
+/// Maximum number of colors in the GPU palette uniform.
+const MAX_PALETTE_COLORS: usize = 16;
+
+/// GPU-side palette struct: count (u32) + padding + 16 × vec4<f32>.
+/// Total: 16 bytes header + 16 × 16 bytes = 272 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuPalette {
+    count: u32,
+    _pad: [u32; 3],
+    colors: [[f32; 4]; MAX_PALETTE_COLORS],
+}
+
+impl GpuPalette {
+    fn from_palette(palette: &ColorPalette) -> Self {
+        let mut gpu = Self {
+            count: palette.len().min(MAX_PALETTE_COLORS as u32),
+            _pad: [0; 3],
+            colors: [[0.0; 4]; MAX_PALETTE_COLORS],
+        };
+        for (i, rgba) in palette.as_slice().iter().take(MAX_PALETTE_COLORS).enumerate() {
+            gpu.colors[i] = *rgba;
+        }
+        gpu
+    }
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
@@ -131,6 +163,8 @@ pub struct Renderer {
     instance_buf: wgpu::Buffer,
     instance_count: u32,
     camera_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    palette_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     // Board background
     board_pipeline: wgpu::RenderPipeline,
@@ -152,7 +186,7 @@ fn ortho_projection(left: f32, right: f32, bottom: f32, top: f32) -> [f32; 16] {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(window: Arc<Window>, palette: &ColorPalette) -> Self {
         let size   = window.inner_size();
         let width  = size.width.max(1);
         let height = size.height.max(1);
@@ -248,27 +282,53 @@ impl Renderer {
             usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // ── palette uniform ─────────────────────────────────────────────
+        let gpu_palette = GpuPalette::from_palette(palette);
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("palette"),
+            contents: bytemuck::cast_slice(&[gpu_palette]),
+            usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label:   Some("camera bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding:    0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty:                 wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size:   None,
+            label:   Some("camera+palette bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding:    0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding:    1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("camera bg"),
+            label:   Some("camera+palette bg"),
             layout:  &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding:  0,
-                resource: camera_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: camera_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: palette_buf.as_entire_binding(),
+                },
+            ],
         });
 
         // ── block render pipeline ────────────────────────────────────────
@@ -440,6 +500,7 @@ impl Renderer {
             instance_buf,
             instance_count: 0,
             camera_buf,
+            palette_buf,
             bind_group,
             board_pipeline,
             board_vertex_buf,
@@ -482,6 +543,13 @@ impl Renderer {
             cy + proj_h / 2.0,
         );
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::cast_slice(&proj));
+    }
+
+    /// Upload a new color palette to the GPU.
+    #[allow(dead_code)]
+    pub fn update_palette(&mut self, palette: &ColorPalette) {
+        let gpu_palette = GpuPalette::from_palette(palette);
+        self.queue.write_buffer(&self.palette_buf, 0, bytemuck::cast_slice(&[gpu_palette]));
     }
 
     /// Upload new block instance data for this frame.

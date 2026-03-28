@@ -1,4 +1,4 @@
-use crate::trimino::{Color, TriminoShape};
+use crate::trimino::{ColorId, TriminoShape};
 
 /// Events emitted by the game state machine each frame.
 /// Drained by the renderer / app layer for visual effects and UI.
@@ -9,7 +9,7 @@ pub enum GameEvent {
         /// World-space positions of the destroyed cells.
         cells: Vec<[f32; 2]>,
         /// Color of the destroyed group.
-        color: Color,
+        color: ColorId,
     },
     /// A piece impacted something (landing, collision).
     Impact {
@@ -21,7 +21,7 @@ pub enum GameEvent {
     /// A new piece was spawned.
     Spawn {
         shape: TriminoShape,
-        colors: [Color; 3],
+        colors: [ColorId; 3],
     },
     /// Player reached a new level.
     LevelUp { level: u32 },

@@ -2,29 +2,23 @@ use glam::Vec2;
 use rapier2d::prelude::*;
 
 use crate::board::Board;
-use crate::trimino::{Color, PieceDescriptor};
+use crate::trimino::{ColorId, PieceDescriptor};
 
 /// Identifier for a piece (group of cells joined together).
 pub type PieceId = u64;
 
 /// Data packed into a rigid body's user_data field.
 /// Low 32 bits: color_id. Next 32 bits: piece_id.
-fn pack_user_data(color: Color, piece_id: PieceId) -> u128 {
+fn pack_user_data(color: ColorId, piece_id: PieceId) -> u128 {
     (color.id() as u128) | ((piece_id as u128) << 32)
 }
 
-fn unpack_color(user_data: u128) -> Color {
-    match (user_data & 0xFFFF_FFFF) as u32 {
-        0 => Color::Red,
-        1 => Color::Blue,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        _ => Color::Red,
-    }
+fn unpack_color(user_data: u128) -> ColorId {
+    ColorId((user_data & 0xFFFF_FFFF) as u32)
 }
 
 /// Public accessor used by the scoring module to read color from body user_data.
-pub fn color_from_user_data(user_data: u128) -> Color {
+pub fn color_from_user_data(user_data: u128) -> ColorId {
     unpack_color(user_data)
 }
 
@@ -49,7 +43,7 @@ pub struct CellInfo {
     pub handle: RigidBodyHandle,
     pub position: Vec2,
     pub rotation: f32,
-    pub color: Color,
+    pub color: ColorId,
     pub piece_id: PieceId,
     pub linvel: Vec2,
 }
@@ -463,11 +457,12 @@ impl PhysicsWorld {
 mod tests {
     use super::*;
     use crate::board::Board;
-    use crate::trimino::{Color, PieceDescriptor, TriminoShape};
+    use crate::trimino::{ColorId, PieceDescriptor, TriminoShape};
 
     #[test]
     fn user_data_roundtrip() {
-        for &color in &Color::ALL {
+        for id in 0..4 {
+            let color = ColorId(id);
             let packed = pack_user_data(color, 42);
             assert_eq!(unpack_color(packed), color);
             assert_eq!(unpack_piece_id(packed), 42);
@@ -478,7 +473,6 @@ mod tests {
     fn physics_world_creates_walls() {
         let board = Board::default();
         let world = PhysicsWorld::new(&board);
-        // Floor + left + right = 3 wall bodies.
         assert_eq!(world.wall_handles.len(), 3);
     }
 
@@ -488,7 +482,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Red; 3],
+            colors: [ColorId(0); 3],
             rotation: 0,
         };
         let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
@@ -501,14 +495,13 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::L,
-            colors: [Color::Blue; 3],
+            colors: [ColorId(1); 3],
             rotation: 0,
         };
         let (piece_id, _) = world.spawn_piece(&desc, board.spawn_position());
         assert!(!world.piece_joints.is_empty());
 
         world.detach_piece(piece_id);
-        // The piece_joints entry should be removed.
         assert!(world
             .piece_joints
             .iter()
@@ -522,7 +515,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::T,
-            colors: [Color::Green; 3],
+            colors: [ColorId(2); 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
@@ -536,13 +529,13 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Yellow; 3],
+            colors: [ColorId(3); 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
         let instances = world.block_instances();
         assert_eq!(instances.len(), 3);
-        assert!(instances.iter().all(|b| b.color_id == Color::Yellow.id()));
+        assert!(instances.iter().all(|b| b.color_id == 3));
     }
 
     #[test]
@@ -551,7 +544,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Red; 3],
+            colors: [ColorId(0); 3],
             rotation: 0,
         };
         world.spawn_piece(&desc, board.spawn_position());
@@ -566,7 +559,7 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Red; 3],
+            colors: [ColorId(0); 3],
             rotation: 0,
         };
         let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
@@ -578,24 +571,19 @@ mod tests {
 
     #[test]
     fn spring_joints_pull_displaced_cells_back() {
-        // Spawn an I-piece in zero gravity, displace one cell, and verify
-        // the spring pulls it back toward its rest position.
         let board = Board::default();
         let mut world = PhysicsWorld::new(&board);
-        // Disable gravity so we measure spring force in isolation.
         world.gravity = vector![0.0, 0.0];
 
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Red; 3],
+            colors: [ColorId(0); 3],
             rotation: 0,
         };
         let (_, handles) = world.spawn_piece(&desc, board.spawn_position());
 
-        // Record initial position of cell 2 (rightmost).
         let initial_pos = world.body_position(handles[2]);
 
-        // Displace cell 2 to the right by 2 units.
         if let Some(body) = world.bodies.get_mut(handles[2]) {
             let t = body.translation();
             body.set_translation(vector![t.x + 2.0, t.y], true);
@@ -603,7 +591,6 @@ mod tests {
         let displaced_pos = world.body_position(handles[2]);
         assert!((displaced_pos.x - initial_pos.x - 2.0).abs() < 0.01);
 
-        // Step physics — the spring should pull cell 2 back.
         for _ in 0..120 {
             world.step(1.0 / 60.0);
         }
@@ -626,13 +613,11 @@ mod tests {
         let mut world = PhysicsWorld::new(&board);
         let desc = PieceDescriptor {
             shape: TriminoShape::I,
-            colors: [Color::Red; 3],
+            colors: [ColorId(0); 3],
             rotation: 0,
         };
         let (piece_id, _) = world.spawn_piece(&desc, board.spawn_position());
 
-        // I-shape has 3 cells in a line. Cells 0-1 and 1-2 are adjacent (distance 1.0),
-        // but 0-2 are not (distance 2.0). So we expect 2 pairs × 4 springs = 8 joints.
         let joints = world.piece_joints.iter().find(|(id, _)| *id == piece_id);
         assert!(joints.is_some());
         let (_, joint_handles) = joints.unwrap();

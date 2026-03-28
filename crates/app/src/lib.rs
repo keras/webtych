@@ -115,9 +115,12 @@ impl ApplicationHandler for App {
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
+        let game_state = GameState::new();
+        let palette = game_state.palette.clone();
+
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.renderer = Some(pollster::block_on(Renderer::new(window.clone())));
+            self.renderer = Some(pollster::block_on(Renderer::new(window.clone(), &palette)));
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -125,12 +128,12 @@ impl ApplicationHandler for App {
             let pending = self.pending.clone();
             let win = window.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let r = Renderer::new(win).await;
+                let r = Renderer::new(win, &palette).await;
                 *pending.borrow_mut() = Some(r);
             });
         }
 
-        self.game_state = Some(GameState::new());
+        self.game_state = Some(game_state);
         self.window = Some(window);
     }
 

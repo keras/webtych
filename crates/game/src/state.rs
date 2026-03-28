@@ -4,7 +4,7 @@ use crate::board::Board;
 use crate::events::GameEvent;
 use crate::physics::{BlockInstance, PhysicsWorld, PieceId};
 use crate::scoring::{detect_matches, ScoreState};
-use crate::trimino::PieceBag;
+use crate::trimino::{ColorPalette, PieceBag};
 
 /// Actions the player can take each frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,7 @@ pub struct GameState {
     pub board: Board,
     pub score: ScoreState,
     pub events: Vec<GameEvent>,
+    pub palette: ColorPalette,
 
     active_piece: Option<PieceId>,
     bag: PieceBag,
@@ -70,6 +71,10 @@ impl Default for GameState {
 
 impl GameState {
     pub fn new() -> Self {
+        Self::with_palette(ColorPalette::default())
+    }
+
+    pub fn with_palette(palette: ColorPalette) -> Self {
         let board = Board::default();
         let physics = PhysicsWorld::new(&board);
         let mut rng = rand::thread_rng();
@@ -81,6 +86,7 @@ impl GameState {
             board,
             score: ScoreState::default(),
             events: Vec::new(),
+            palette,
             active_piece: None,
             bag,
             rng,
@@ -134,7 +140,7 @@ impl GameState {
             return;
         }
 
-        let descriptor = self.bag.next(&mut self.rng);
+        let descriptor = self.bag.next(&mut self.rng, &self.palette);
         let center = self.board.spawn_position();
         let (piece_id, _) = self.physics.spawn_piece(&descriptor, center);
         self.active_piece = Some(piece_id);

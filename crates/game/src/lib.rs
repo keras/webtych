@@ -9,4 +9,4 @@ pub use board::Board;
 pub use events::GameEvent;
 pub use physics::BlockInstance;
 pub use state::{GameState, InputAction};
-pub use trimino::Color;
+pub use trimino::{ColorId, ColorPalette};
