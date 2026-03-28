@@ -146,7 +146,10 @@ impl ApplicationHandler for App {
         // Promote async-initialised renderer once it's ready.
         #[cfg(target_arch = "wasm32")]
         if self.renderer.is_none() {
-            if let Some(r) = self.pending.borrow_mut().take() {
+            if let Some(mut r) = self.pending.borrow_mut().take() {
+                if let Some(win) = self.window.as_ref() {
+                    r.resize(win.inner_size());
+                }
                 self.renderer = Some(r);
             }
         }
