@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rapier2d = { version = "0.22", features = ["enhanced-determinism"] }
+rapier2d = { version = "0.22" }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 rand = "0.8"
