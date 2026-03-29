@@ -120,37 +120,6 @@ impl Simulation {
     pub fn set_obstacles(&mut self, queue: &wgpu::Queue, patches: &[ObstaclePatch]) {
         rasterise_obstacles(patches, &self.config, &mut self.obstacle_scratch);
 
-        // Re-seed distributions for cells that just transitioned solid → fluid
-        // (trailing edge of moving obstacles).  Without this, vacated cells hold
-        // stale distributions from when they were solid, causing a pressure pulse
-        // or NaN at the trailing edge.  We seed at ambient density (ρ=1) with the
-        // obstacle's last velocity so the newly exposed cell starts in a
-        // physically plausible state rather than injecting a spurious pressure spike.
-        // for idx in 0..self.obstacle_scratch.len() {
-        //     // Re-seed as soon as the cell drops below fully-solid (> 0.999).
-        //     // This matches the threshold used in the collide shader — BGK starts
-        //     // running on a partial cell the moment it's no longer fully solid,
-        //     // so we need valid distributions from that point, not only at 0.5.
-        //     let was_fully_solid = self.prev_obstacle_scratch[idx].mask > 0.999;
-        //     let is_fully_solid = self.obstacle_scratch[idx].mask > 0.999;
-        //     if was_fully_solid && !is_fully_solid {
-        //         let vel_x = self.prev_obstacle_scratch[idx].vel_x;
-        //         let vel_y = self.prev_obstacle_scratch[idx].vel_y;
-        //         let eq = feq_all(1.0, vel_x, vel_y);
-        //         let offset = (idx * 9 * std::mem::size_of::<f32>()) as u64;
-        //         queue.write_buffer(
-        //             self.grid.src_distributions(),
-        //             offset,
-        //             bytemuck::bytes_of(&eq),
-        //         );
-        //         queue.write_buffer(
-        //             self.grid.dst_distributions(),
-        //             offset,
-        //             bytemuck::bytes_of(&eq),
-        //         );
-        //     }
-        // }
-
         // Stamp open-boundary flags into the A channel before upload.
         for (texel, &flag) in self
             .obstacle_scratch
@@ -288,36 +257,4 @@ impl Simulation {
     pub fn color_density_buffer(&self) -> &wgpu::Buffer {
         &self.grid.color_densities
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CPU-side LBM helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Compute the D2Q9 equilibrium distribution for all 9 directions at (ρ, u_x, u_y).
-///
-/// Used to re-seed cells that transition from solid → fluid so they start with a
-/// physically meaningful state rather than stale/zeroed distributions.
-fn feq_all(rho: f32, ux: f32, uy: f32) -> [f32; 9] {
-    const EX: [f32; 9] = [0., 1., 0., -1., 0., 1., -1., -1., 1.];
-    const EY: [f32; 9] = [0., 0., 1., 0., -1., 1., 1., -1., -1.];
-    const W: [f32; 9] = [
-        4. / 9.,
-        1. / 9.,
-        1. / 9.,
-        1. / 9.,
-        1. / 9.,
-        1. / 36.,
-        1. / 36.,
-        1. / 36.,
-        1. / 36.,
-    ];
-    const CS2: f32 = 1.0 / 3.0;
-    let uu = ux * ux + uy * uy;
-    let mut f = [0f32; 9];
-    for i in 0..9 {
-        let eu = EX[i] * ux + EY[i] * uy;
-        f[i] = W[i] * rho * (1.0 + eu / CS2 + eu * eu / (2.0 * CS2 * CS2) - uu / (2.0 * CS2));
-    }
-    f
 }
