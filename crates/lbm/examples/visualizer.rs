@@ -244,28 +244,27 @@ impl ApplicationHandler for App {
 
         // Always track cursor position — egui often marks CursorMoved as consumed
         // even over the field area, which would leave mouse_pos stale.
+        // Normalise x relative to the field area width (not the full window) so
+        // that all downstream consumers get 0..1 in field-space directly.
         if let WindowEvent::CursorMoved { position, .. } = &event {
             let size = state.window.inner_size();
+            let panel_phys = (200.0 * state.window.scale_factor()) as u32;
+            let field_w = size.width.saturating_sub(panel_phys).max(1);
             state.mouse_pos = Some((
-                position.x as f32 / size.width.max(1) as f32,
+                position.x as f32 / field_w as f32,
                 position.y as f32 / size.height.max(1) as f32,
             ));
         }
 
-        // For mouse clicks: inject if the click is in the field area (left of the
-        // egui panel). We use physical pixels; the panel is ~200 logical px wide.
+        // Inject if the click is in the field area (nx < 1.0 means left of panel).
         if let WindowEvent::MouseInput {
             state: ElementState::Pressed,
             button: MouseButton::Left,
             ..
         } = &event
         {
-            let phys = state.window.inner_size();
-            let panel_phys = (200.0 * state.window.scale_factor()) as u32;
-            let field_right = phys.width.saturating_sub(panel_phys);
             if let Some((nx, ny)) = state.mouse_pos {
-                let phys_x = (nx * phys.width as f32) as u32;
-                if phys_x < field_right {
+                if nx < 1.0 {
                     let x = nx * state.sim.config.world_width;
                     let y = ny * state.sim.config.world_height;
                     state.sim.push_event(InjectionEvent {
@@ -656,13 +655,15 @@ fn update_and_render(state: &mut AppState) {
 
     // ── Update vis uniform (window size may have changed on resize) ─────────
     let phys = state.window.inner_size();
+    let panel_phys = (200.0 * state.window.scale_factor()) as u32;
+    let field_w = phys.width.saturating_sub(panel_phys).max(1);
     state.queue.write_buffer(
         &state.vis_uniform_buf,
         0,
         bytemuck::bytes_of(&VisUniforms {
             grid_w: GRID_W,
             grid_h: GRID_H,
-            win_w: phys.width.max(1),
+            win_w: field_w,
             win_h: phys.height.max(1),
             peak_rho: (state.peak_rho * 1.1).max(1.01),
             _pad0: 0,
@@ -742,7 +743,7 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.separator();
                 ui.label("Cell under cursor:");
-                if let Some((nx, ny)) = state.mouse_pos {
+                if let Some((nx, ny)) = state.mouse_pos.filter(|(nx, _)| *nx < 1.0) {
                     let gx = ((nx * GRID_W as f32).floor() as u32).min(GRID_W - 1);
                     let gy = ((ny * GRID_H as f32).floor() as u32).min(GRID_H - 1);
                     let cell_idx = (gy * GRID_W + gx) as usize;
@@ -812,9 +813,10 @@ fn update_and_render(state: &mut AppState) {
             depth_stencil_attachment: None,
             ..Default::default()
         });
+        rp.set_scissor_rect(0, 0, field_w, phys.height.max(1));
         rp.set_pipeline(&state.vis_pipeline);
         rp.set_bind_group(0, &state.vis_bind_group, &[]);
-        rp.draw(0..3, 0..1); // fullscreen triangle
+        rp.draw(0..3, 0..1); // fullscreen triangle (clipped to field area)
     }
 
     // ── egui render pass ─────────────────────────────────────────────────

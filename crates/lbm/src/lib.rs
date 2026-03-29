@@ -54,4 +54,4 @@ pub mod types;
 
 pub use config::{EffectProfile, SimConfig};
 pub use simulation::Simulation;
-pub use types::{InjectionEvent, ObstaclePatch, OpenBoundaryPatch};
+pub use types::{EventKind, InjectionEvent, ObstaclePatch, OpenBoundaryPatch};
