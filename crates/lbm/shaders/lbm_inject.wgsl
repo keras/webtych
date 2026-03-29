@@ -90,52 +90,55 @@ fn dist_index(cell: u32, i: u32) -> u32 {
     return cell * 9u + i;
 }
 
-/// Add a D2Q9 equilibrium delta to the current distributions at `cell`.
-///
-/// This keeps the existing flow state and makes event injection additive
-/// instead of replacing the whole cell state.
-fn add_injection_delta(cell: u32, delta_rho: f32, ux: f32, uy: f32) {
-    let uu = ux * ux + uy * uy;
-    let cs2 = 1.0 / 3.0;
-    for (var i: u32 = 0u; i < 9u; i++) {
-        var ex = 0.0;
-        var ey = 0.0;
-        if i == 1u { ex = 1.0; }
-        if i == 2u { ey = 1.0; }
-        if i == 3u { ex = -1.0; }
-        if i == 4u { ey = -1.0; }
-        if i == 5u { ex = 1.0; ey = 1.0; }
-        if i == 6u { ex = -1.0; ey = 1.0; }
-        if i == 7u { ex = -1.0; ey = -1.0; }
-        if i == 8u { ex = 1.0; ey = -1.0; }
+// D2Q9 lattice velocity vectors (float) for equilibrium calculations.
+const LEX = array<f32, 9>(0.0,  1.0, 0.0, -1.0,  0.0,  1.0, -1.0, -1.0,  1.0);
+const LEY = array<f32, 9>(0.0,  0.0, 1.0,  0.0, -1.0,  1.0,  1.0, -1.0, -1.0);
+const CS2: f32 = 1.0 / 3.0;
 
-        let eu = ex * ux + ey * uy;
-        let feq = weight(i) * (1.0 + delta_rho)
-            * (1.0 + eu / cs2 + (eu * eu) / (2.0 * cs2 * cs2) - uu / (2.0 * cs2));
-        let feq0 = weight(i);
-        dist_src[dist_index(cell, i)] += (feq - feq0);
+fn f_eq(i: u32, rho: f32, ux: f32, uy: f32) -> f32 {
+    let eu = LEX[i] * ux + LEY[i] * uy;
+    let uu = ux * ux + uy * uy;
+    return weight(i) * rho * (1.0 + eu / CS2 + eu * eu / (2.0 * CS2 * CS2) - uu / (2.0 * CS2));
+}
+
+/// Add density and momentum to a cell as an additive source term.
+///
+/// Reads the cell's current macroscopic state and computes the equilibrium
+/// delta relative to it, so individual f_i stay physical and never go negative
+/// from the injector alone.
+fn add_injection_delta(cell: u32, delta_rho: f32, ux_inject: f32, uy_inject: f32) {
+    // Read current macroscopic state from the distributions.
+    var rho_cur = 0.0;
+    var mx_cur  = 0.0;
+    var my_cur  = 0.0;
+    for (var i: u32 = 0u; i < 9u; i++) {
+        let fi = dist_src[dist_index(cell, i)];
+        rho_cur += fi;
+        mx_cur  += fi * LEX[i];
+        my_cur  += fi * LEY[i];
+    }
+    if rho_cur < 1e-6 { rho_cur = 1e-6; }
+    let ux_cur = mx_cur / rho_cur;
+    let uy_cur = my_cur / rho_cur;
+
+    // Target: add density; blend velocity by momentum conservation.
+    let rho_new = rho_cur + delta_rho;
+    let ux_new  = (rho_cur * ux_cur + delta_rho * ux_inject) / rho_new;
+    let uy_new  = (rho_cur * uy_cur + delta_rho * uy_inject) / rho_new;
+
+    // Delta = f_eq(new state) − f_eq(current state).
+    // Sum is exactly +delta_rho and individual deltas are small perturbations.
+    for (var i: u32 = 0u; i < 9u; i++) {
+        let idx = dist_index(cell, i);
+        dist_src[idx] += f_eq(i, rho_new, ux_new, uy_new)
+                       - f_eq(i, rho_cur, ux_cur, uy_cur);
     }
 }
 
 /// Replace cell distributions with a full equilibrium state at injected density.
 fn set_injection_equilibrium(cell: u32, rho: f32, ux: f32, uy: f32) {
-    let uu = ux * ux + uy * uy;
-    let cs2 = 1.0 / 3.0;
     for (var i: u32 = 0u; i < 9u; i++) {
-        var ex = 0.0;
-        var ey = 0.0;
-        if i == 1u { ex = 1.0; }
-        if i == 2u { ey = 1.0; }
-        if i == 3u { ex = -1.0; }
-        if i == 4u { ey = -1.0; }
-        if i == 5u { ex = 1.0; ey = 1.0; }
-        if i == 6u { ex = -1.0; ey = 1.0; }
-        if i == 7u { ex = -1.0; ey = -1.0; }
-        if i == 8u { ex = 1.0; ey = -1.0; }
-
-        let eu = ex * ux + ey * uy;
-        dist_src[dist_index(cell, i)] =
-            weight(i) * rho * (1.0 + eu / cs2 + (eu * eu) / (2.0 * cs2 * cs2) - uu / (2.0 * cs2));
+        dist_src[dist_index(cell, i)] = f_eq(i, rho, ux, uy);
     }
 }
 

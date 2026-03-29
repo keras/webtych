@@ -153,6 +153,7 @@ struct AppState {
     block_speed_ui: f32,           // phase increment per step
     gravity_ui: f32,               // gravity_y fed to sim config
     additive_injection_ui: bool,
+    macroscopic_data: Vec<f32>,    // last readback of [rho, ux, uy] per cell
 
     window: Arc<Window>,
 }
@@ -509,6 +510,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         block_speed_ui: 0.005,
         gravity_ui: 0.0003,
         additive_injection_ui: true,
+        macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
         window,
     }
 }
@@ -704,6 +706,23 @@ fn update_and_render(state: &mut AppState) {
                 ui.label(format!("τ (active) : {sim_tau_ref:.3}"));
 
                 ui.separator();
+                ui.label("Cell under cursor:");
+                if let Some((nx, ny)) = state.mouse_pos {
+                    let gx = ((nx * GRID_W as f32).floor() as u32).min(GRID_W - 1);
+                    let gy = ((ny * GRID_H as f32).floor() as u32).min(GRID_H - 1);
+                    let cell_idx = (gy * GRID_W + gx) as usize;
+                    let rho = state.macroscopic_data[cell_idx * 3];
+                    let ux = state.macroscopic_data[cell_idx * 3 + 1];
+                    let uy = state.macroscopic_data[cell_idx * 3 + 2];
+                    ui.label(format!("  ({}, {})", gx, gy));
+                    ui.label(format!("  ρ : {:.4}", rho));
+                    ui.label(format!("  u_x : {:.4}", ux));
+                    ui.label(format!("  u_y : {:.4}", uy));
+                } else {
+                    ui.label("  (move cursor over field)");
+                }
+
+                ui.separator();
                 ui.label("Left-click on field to inject");
             });
     });
@@ -870,6 +889,7 @@ fn do_readback(state: &mut AppState) {
         }
         state.peak_rho = peak;
         state.nonambient = na;
+        state.macroscopic_data = data;
     }
 }
 
