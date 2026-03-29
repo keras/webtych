@@ -86,10 +86,21 @@ pub struct InjectionEvent {
     pub y: f32,
     /// Strength multiplier applied on top of the per-colour effect profile.
     pub intensity: f32,
+    /// Injection stamp radius in world-space units.
+    ///
+    /// The `lbm_inject` pass samples a stamp texture in this radius around
+    /// (`x`, `y`) and uses the sampled mask to spread injection over an area.
+    pub stamp_radius: f32,
     /// Which colour channel to inject density into (index into colour buffer array).
     pub color_id: u32,
     /// Destroy or impact.
     pub kind: EventKind,
+    /// Multiplier applied to the velocity profile sampled from the injection stamp.
+    pub velocity_scale: f32,
+    /// Constant velocity bias added to injected fluid (lattice units / step).
+    pub base_vel_x: f32,
+    /// Constant velocity bias added to injected fluid (lattice units / step).
+    pub base_vel_y: f32,
 }
 
 /// GPU-mapped representation of [`InjectionEvent`].
@@ -100,9 +111,12 @@ pub struct InjectionEvent {
 pub struct GpuEvent {
     pub position: [f32; 2],
     pub intensity: f32,
+    pub stamp_radius: f32,
     pub color_id: u32,
     pub event_type: u32,
-    pub _pad: [u32; 3],
+    pub velocity_scale: f32,
+    pub base_vel_x: f32,
+    pub base_vel_y: f32,
 }
 
 impl From<&InjectionEvent> for GpuEvent {
@@ -110,9 +124,12 @@ impl From<&InjectionEvent> for GpuEvent {
         Self {
             position: [e.x, e.y],
             intensity: e.intensity,
+            stamp_radius: e.stamp_radius,
             color_id: e.color_id,
             event_type: e.kind as u32,
-            _pad: [0; 3],
+            velocity_scale: e.velocity_scale,
+            base_vel_x: e.base_vel_x,
+            base_vel_y: e.base_vel_y,
         }
     }
 }
@@ -149,5 +166,8 @@ pub struct LbmUniforms {
     /// Positive Y = toward bottom of screen (increasing pixel Y).
     pub gravity_x: f32,
     pub gravity_y: f32,
-    pub _pad: [u32; 2],
+    /// Injection write mode.
+    /// 0 = replacement (overwrite cell state), 1 = additive (delta onto existing state).
+    pub injection_mode: u32,
+    pub _pad: u32,
 }

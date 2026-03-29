@@ -9,6 +9,9 @@ use wgpu::util::DeviceExt;
 use crate::config::{SimConfig, MAX_COLORS, MAX_EVENTS};
 use crate::types::{GpuEvent, LbmUniforms, ObstacleTexel};
 
+/// Side length of the injection stamp texture used by `lbm_inject`.
+pub const INJECTION_STAMP_SIZE: u32 = 64;
+
 /// All GPU-side resources for one simulation instance.
 pub struct GpuGrid {
     // ── Distribution function buffers (ping-pong) ────────────────────────────
@@ -28,9 +31,15 @@ pub struct GpuGrid {
     pub obstacle_texture: wgpu::Texture,
     pub obstacle_texture_view: wgpu::TextureView,
 
+    /// Injection stamp texture sampled by the inject pass.
+    ///
+    /// Layout: R=mask, G=velocity_x profile, B=velocity_y profile, A=unused.
+    pub injection_texture: wgpu::Texture,
+    pub injection_texture_view: wgpu::TextureView,
+
     // ── Colour density buffer (packed) ───────────────────────────────────────
-        /// Single packed buffer: `color_densities[cell * MAX_COLORS + channel]`.
-        /// Size: `cell_count * MAX_COLORS * sizeof(f32)` bytes.
+    /// Single packed buffer: `color_densities[cell * MAX_COLORS + channel]`.
+    /// Size: `cell_count * MAX_COLORS * sizeof(f32)` bytes.
     pub color_densities: wgpu::Buffer,
 
     // ── Event ring buffer ────────────────────────────────────────────────────
@@ -54,8 +63,17 @@ impl GpuGrid {
 
         // Initialise distributions to equilibrium: f_i = w_i * rho0, rho0=1.
         // D2Q9 weights: w0=4/9, w1-4=1/9, w5-8=1/36
-        let weights: [f32; 9] = [4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
-                                  1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0];
+        let weights: [f32; 9] = [
+            4.0 / 9.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            1.0 / 36.0,
+            1.0 / 36.0,
+            1.0 / 36.0,
+            1.0 / 36.0,
+        ];
         let init_data: Vec<f32> = (0..cell_count)
             .flat_map(|_| weights.iter().copied())
             .collect();
@@ -103,6 +121,23 @@ impl GpuGrid {
         let obstacle_texture_view =
             obstacle_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let injection_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lbm::injection_texture"),
+            size: wgpu::Extent3d {
+                width: INJECTION_STAMP_SIZE,
+                height: INJECTION_STAMP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let injection_texture_view =
+            injection_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         // Packed colour density buffer: [cell * MAX_COLORS + channel].
         // Always MAX_COLORS slots per cell; unused channels simply stay zero.
         let zero_color: Vec<f32> = vec![0.0f32; cell_count as usize * MAX_COLORS];
@@ -135,6 +170,8 @@ impl GpuGrid {
             macroscopic,
             obstacle_texture,
             obstacle_texture_view,
+            injection_texture,
+            injection_texture_view,
             color_densities,
             event_buffer,
             uniform_buffer,
@@ -146,12 +183,20 @@ impl GpuGrid {
     /// Return the storage buffer currently holding the "current" distributions
     /// (the one the collision/inject passes read from).
     pub fn src_distributions(&self) -> &wgpu::Buffer {
-        if self.pong { &self.distributions_b } else { &self.distributions_a }
+        if self.pong {
+            &self.distributions_b
+        } else {
+            &self.distributions_a
+        }
     }
 
     /// Return the storage buffer to write the post-streaming distributions into.
     pub fn dst_distributions(&self) -> &wgpu::Buffer {
-        if self.pong { &self.distributions_a } else { &self.distributions_b }
+        if self.pong {
+            &self.distributions_a
+        } else {
+            &self.distributions_b
+        }
     }
 
     /// Swap ping-pong buffers.
@@ -183,4 +228,61 @@ impl GpuGrid {
             },
         );
     }
+
+    /// Upload the injection stamp texture used by the event inject pass.
+    pub fn upload_injection_texture(&self, queue: &wgpu::Queue, data: &[[f32; 4]]) {
+        assert_eq!(
+            data.len(),
+            (INJECTION_STAMP_SIZE * INJECTION_STAMP_SIZE) as usize,
+            "injection texture data length mismatch"
+        );
+
+        queue.write_texture(
+            self.injection_texture.as_image_copy(),
+            bytemuck::cast_slice(data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(INJECTION_STAMP_SIZE * std::mem::size_of::<[f32; 4]>() as u32),
+                rows_per_image: Some(INJECTION_STAMP_SIZE),
+            },
+            wgpu::Extent3d {
+                width: INJECTION_STAMP_SIZE,
+                height: INJECTION_STAMP_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
+/// Build a default radial injection stamp texture.
+///
+/// R = density mask (soft circular falloff)
+/// G,B = normalized outward velocity profile in [-1, 1]
+pub fn build_default_injection_stamp() -> Vec<[f32; 4]> {
+    let n = INJECTION_STAMP_SIZE as usize;
+    let mut out = vec![[0.0f32; 4]; n * n];
+
+    for y in 0..n {
+        for x in 0..n {
+            let u = (x as f32 + 0.5) / n as f32;
+            let v = (y as f32 + 0.5) / n as f32;
+            let dx = 2.0 * (u - 0.5);
+            let dy = 2.0 * (v - 0.5);
+            let r = (dx * dx + dy * dy).sqrt();
+
+            let mask = if r < 1.0 {
+                let t = 1.0 - r;
+                t * t
+            } else {
+                0.0
+            };
+
+            let norm = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let vx = if mask > 0.0 { dx / norm } else { 0.0 };
+            let vy = if mask > 0.0 { dy / norm } else { 0.0 };
+            out[y * n + x] = [mask, vx, vy, 0.0];
+        }
+    }
+
+    out
 }

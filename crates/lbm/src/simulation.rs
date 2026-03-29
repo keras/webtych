@@ -13,7 +13,17 @@
 //! sim.set_obstacles(&queue, &obstacle_patches);
 //!
 //! // 2. Enqueue any destruction / impact events from game logic.
-//! sim.push_event(InjectionEvent { x: 5.0, y: 10.0, intensity: 1.0, color_id: 2, kind: EventKind::Destroy });
+//! sim.push_event(InjectionEvent {
+//!     x: 5.0,
+//!     y: 10.0,
+//!     intensity: 1.0,
+//!     stamp_radius: 0.6,
+//!     color_id: 2,
+//!     kind: EventKind::Destroy,
+//!     velocity_scale: 0.05,
+//!     base_vel_x: 0.0,
+//!     base_vel_y: 0.0,
+//! });
 //!
 //! // 3. Advance the simulation one step.
 //! sim.step(&device, &queue);
@@ -26,7 +36,7 @@ use crate::config::SimConfig;
 use crate::gpu::{
     build_bind_group, build_uniforms, encode_lbm_passes, rasterise_obstacles, GpuPipelines,
 };
-use crate::grid::GpuGrid;
+use crate::grid::{build_default_injection_stamp, GpuGrid};
 use crate::types::{
     GpuEvent, InjectionEvent, LbmUniforms, ObstaclePatch, ObstacleTexel, OpenBoundaryPatch,
 };
@@ -57,6 +67,13 @@ pub struct Simulation {
     /// Cells with value 1.0 are forced to equilibrium at ambient density each step.
     /// Populated by [`set_open_boundaries`]; merged into the obstacle texture upload.
     open_boundary_flags: Vec<f32>,
+
+    /// Whether the default injection stamp texture has been uploaded.
+    injection_stamp_uploaded: bool,
+
+    /// Event injection mode.
+    /// true = additive delta, false = replacement overwrite.
+    additive_injection: bool,
 }
 
 impl Simulation {
@@ -89,6 +106,8 @@ impl Simulation {
             prev_obstacle_scratch,
             pending_events: Vec::new(),
             open_boundary_flags,
+            injection_stamp_uploaded: false,
+            additive_injection: true,
         }
     }
 
@@ -107,30 +126,30 @@ impl Simulation {
         // or NaN at the trailing edge.  We seed at ambient density (ρ=1) with the
         // obstacle's last velocity so the newly exposed cell starts in a
         // physically plausible state rather than injecting a spurious pressure spike.
-        for idx in 0..self.obstacle_scratch.len() {
-            // Re-seed as soon as the cell drops below fully-solid (> 0.999).
-            // This matches the threshold used in the collide shader — BGK starts
-            // running on a partial cell the moment it's no longer fully solid,
-            // so we need valid distributions from that point, not only at 0.5.
-            let was_fully_solid = self.prev_obstacle_scratch[idx].mask > 0.999;
-            let is_fully_solid = self.obstacle_scratch[idx].mask > 0.999;
-            if was_fully_solid && !is_fully_solid {
-                let vel_x = self.prev_obstacle_scratch[idx].vel_x;
-                let vel_y = self.prev_obstacle_scratch[idx].vel_y;
-                let eq = feq_all(1.0, vel_x, vel_y);
-                let offset = (idx * 9 * std::mem::size_of::<f32>()) as u64;
-                queue.write_buffer(
-                    self.grid.src_distributions(),
-                    offset,
-                    bytemuck::bytes_of(&eq),
-                );
-                queue.write_buffer(
-                    self.grid.dst_distributions(),
-                    offset,
-                    bytemuck::bytes_of(&eq),
-                );
-            }
-        }
+        // for idx in 0..self.obstacle_scratch.len() {
+        //     // Re-seed as soon as the cell drops below fully-solid (> 0.999).
+        //     // This matches the threshold used in the collide shader — BGK starts
+        //     // running on a partial cell the moment it's no longer fully solid,
+        //     // so we need valid distributions from that point, not only at 0.5.
+        //     let was_fully_solid = self.prev_obstacle_scratch[idx].mask > 0.999;
+        //     let is_fully_solid = self.obstacle_scratch[idx].mask > 0.999;
+        //     if was_fully_solid && !is_fully_solid {
+        //         let vel_x = self.prev_obstacle_scratch[idx].vel_x;
+        //         let vel_y = self.prev_obstacle_scratch[idx].vel_y;
+        //         let eq = feq_all(1.0, vel_x, vel_y);
+        //         let offset = (idx * 9 * std::mem::size_of::<f32>()) as u64;
+        //         queue.write_buffer(
+        //             self.grid.src_distributions(),
+        //             offset,
+        //             bytemuck::bytes_of(&eq),
+        //         );
+        //         queue.write_buffer(
+        //             self.grid.dst_distributions(),
+        //             offset,
+        //             bytemuck::bytes_of(&eq),
+        //         );
+        //     }
+        // }
 
         // Stamp open-boundary flags into the A channel before upload.
         for (texel, &flag) in self
@@ -193,6 +212,11 @@ impl Simulation {
         }
     }
 
+    /// Select whether event injection is additive or replacement-style.
+    pub fn set_additive_injection(&mut self, additive: bool) {
+        self.additive_injection = additive;
+    }
+
     /// Advance the simulation by one LBM step.
     ///
     /// 1. Uploads pending events and uniforms.
@@ -200,6 +224,12 @@ impl Simulation {
     /// 3. Submits to the queue.
     /// 4. Swaps ping-pong buffers.
     pub fn step(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if !self.injection_stamp_uploaded {
+            let stamp = build_default_injection_stamp();
+            self.grid.upload_injection_texture(queue, &stamp);
+            self.injection_stamp_uploaded = true;
+        }
+
         // Upload events to GPU.
         let event_count = self.pending_events.len() as u32;
         if event_count > 0 {
@@ -214,7 +244,8 @@ impl Simulation {
         }
 
         // Upload uniforms.
-        let uniforms: LbmUniforms = build_uniforms(&self.config, event_count);
+        let uniforms: LbmUniforms =
+            build_uniforms(&self.config, event_count, self.additive_injection);
         queue.write_buffer(&self.grid.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         // Build bind group (ping-pong state may have changed since last frame).

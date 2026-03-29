@@ -50,7 +50,8 @@ impl GpuPipelines {
         //  3  — macroscopic buffer (r/w storage)
         //  4  — obstacle texture (sampled)
         //  5  — event ring buffer (read storage)
-        //  6…N — color density buffers (r/w storage), one per colour
+        //  6   — packed color density buffer (r/w storage)
+        //  7   — injection stamp texture (sampled)
         //
         // Not all passes use every binding, but using the same layout
         // everywhere means we only need one bind group.
@@ -132,6 +133,17 @@ impl GpuPipelines {
                 ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 min_binding_size: None,
+            },
+            count: None,
+        });
+
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 7,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
             },
             count: None,
         });
@@ -256,6 +268,11 @@ pub fn build_bind_group(
     });
     // grid.color_densities is a single packed buffer: [cell * MAX_COLORS + channel].
 
+    entries.push(wgpu::BindGroupEntry {
+        binding: 7,
+        resource: wgpu::BindingResource::TextureView(&grid.injection_texture_view),
+    });
+
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("lbm::bind_group"),
         layout,
@@ -369,7 +386,11 @@ pub fn rasterise_obstacles(
 }
 
 /// Build the [`LbmUniforms`] struct from config + per-frame event count.
-pub fn build_uniforms(config: &SimConfig, event_count: u32) -> LbmUniforms {
+pub fn build_uniforms(
+    config: &SimConfig,
+    event_count: u32,
+    additive_injection: bool,
+) -> LbmUniforms {
     let mut inject_densities = [[0f32; 4]; 2];
     let mut inject_color_densities = [[0f32; 4]; 2];
     let mut dissipations = [[0f32; 4]; 2];
@@ -394,6 +415,7 @@ pub fn build_uniforms(config: &SimConfig, event_count: u32) -> LbmUniforms {
         dissipations,
         gravity_x: config.gravity_x,
         gravity_y: config.gravity_y,
-        _pad: [0; 2],
+        injection_mode: if additive_injection { 1 } else { 0 },
+        _pad: 0,
     }
 }

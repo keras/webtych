@@ -26,16 +26,19 @@ struct LbmUniforms {
 
     gravity_x: f32,
     gravity_y: f32,
+    injection_mode: u32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 struct GpuEvent {
     position:   vec2<f32>,
     intensity:  f32,
+    stamp_radius: f32,
     color_id:   u32,
     event_type: u32,
-    _pad:       vec3<u32>,
+    velocity_scale: f32,
+    base_vel_x: f32,
+    base_vel_y: f32,
 }
 
 // ── Bindings ─────────────────────────────────────────────────────────────────
@@ -48,6 +51,7 @@ struct GpuEvent {
 @group(0) @binding(5) var<storage, read>       events:          array<GpuEvent>;
 // Packed colour-density buffer: index = cell * MAX_COLORS + channel
 @group(0) @binding(6) var<storage, read_write> color_densities: array<f32>;
+@group(0) @binding(7) var injection_stamp: texture_2d<f32>;
 
 // ── D2Q9 constants ────────────────────────────────────────────────────────────
 
@@ -86,11 +90,52 @@ fn dist_index(cell: u32, i: u32) -> u32 {
     return cell * 9u + i;
 }
 
-/// Set all 9 distributions at `cell` to the D2Q9 equilibrium at rest
-/// (u = 0) with density `rho`:  f_i = w_i * rho.
-fn inject_equilibrium(cell: u32, rho: f32) {
+/// Add a D2Q9 equilibrium delta to the current distributions at `cell`.
+///
+/// This keeps the existing flow state and makes event injection additive
+/// instead of replacing the whole cell state.
+fn add_injection_delta(cell: u32, delta_rho: f32, ux: f32, uy: f32) {
+    let uu = ux * ux + uy * uy;
+    let cs2 = 1.0 / 3.0;
     for (var i: u32 = 0u; i < 9u; i++) {
-        dist_src[dist_index(cell, i)] = weight(i) * rho;
+        var ex = 0.0;
+        var ey = 0.0;
+        if i == 1u { ex = 1.0; }
+        if i == 2u { ey = 1.0; }
+        if i == 3u { ex = -1.0; }
+        if i == 4u { ey = -1.0; }
+        if i == 5u { ex = 1.0; ey = 1.0; }
+        if i == 6u { ex = -1.0; ey = 1.0; }
+        if i == 7u { ex = -1.0; ey = -1.0; }
+        if i == 8u { ex = 1.0; ey = -1.0; }
+
+        let eu = ex * ux + ey * uy;
+        let feq = weight(i) * (1.0 + delta_rho)
+            * (1.0 + eu / cs2 + (eu * eu) / (2.0 * cs2 * cs2) - uu / (2.0 * cs2));
+        let feq0 = weight(i);
+        dist_src[dist_index(cell, i)] += (feq - feq0);
+    }
+}
+
+/// Replace cell distributions with a full equilibrium state at injected density.
+fn set_injection_equilibrium(cell: u32, rho: f32, ux: f32, uy: f32) {
+    let uu = ux * ux + uy * uy;
+    let cs2 = 1.0 / 3.0;
+    for (var i: u32 = 0u; i < 9u; i++) {
+        var ex = 0.0;
+        var ey = 0.0;
+        if i == 1u { ex = 1.0; }
+        if i == 2u { ey = 1.0; }
+        if i == 3u { ex = -1.0; }
+        if i == 4u { ey = -1.0; }
+        if i == 5u { ex = 1.0; ey = 1.0; }
+        if i == 6u { ex = -1.0; ey = 1.0; }
+        if i == 7u { ex = -1.0; ey = -1.0; }
+        if i == 8u { ex = 1.0; ey = -1.0; }
+
+        let eu = ex * ux + ey * uy;
+        dist_src[dist_index(cell, i)] =
+            weight(i) * rho * (1.0 + eu / cs2 + (eu * eu) / (2.0 * cs2 * cs2) - uu / (2.0 * cs2));
     }
 }
 
@@ -98,6 +143,14 @@ fn inject_equilibrium(cell: u32, rho: f32) {
 fn inject_color(cell: u32, channel: u32, amount: f32) {
     let idx = cell * MAX_COLORS + channel;
     color_densities[idx] += amount;
+}
+
+/// Sample the injection stamp texture at UV in [0,1].
+fn sample_stamp(uv: vec2<f32>) -> vec4<f32> {
+    let dims = textureDimensions(injection_stamp);
+    let sx = min(dims.x - 1u, u32(clamp(uv.x, 0.0, 0.999999) * f32(dims.x)));
+    let sy = min(dims.y - 1u, u32(clamp(uv.y, 0.0, 0.999999) * f32(dims.y)));
+    return textureLoad(injection_stamp, vec2<i32>(i32(sx), i32(sy)), 0);
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -118,30 +171,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var e: u32 = 0u; e < u.event_count; e++) {
         let ev = events[e];
 
-        // Convert world-space position to grid coordinates.
-        let ex = (ev.position.x / u.world_width)  * f32(u.grid_width);
-        let ey = (ev.position.y / u.world_height) * f32(u.grid_height);
+        let stamp_radius = max(ev.stamp_radius, 1e-4);
+        let wx = (f32(gx) + 0.5) * u.world_width / f32(u.grid_width);
+        let wy = (f32(gy) + 0.5) * u.world_height / f32(u.grid_height);
 
-        // Apply within a 3×3 cell radius (soft injection zone).
-        let dx = f32(gx) + 0.5 - ex;
-        let dy = f32(gy) + 0.5 - ey;
-        let dist2 = dx * dx + dy * dy;
-        let radius = 3.0;
-        if dist2 > radius * radius { continue; }
+        let uv = vec2<f32>(
+            (wx - ev.position.x) / (2.0 * stamp_radius) + 0.5,
+            (wy - ev.position.y) / (2.0 * stamp_radius) + 0.5,
+        );
+        if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 { continue; }
 
-        let falloff = 1.0 - sqrt(dist2) / radius;
+        let stamp = sample_stamp(uv);
+        let mask = stamp.r;
+        if mask <= 1e-4 { continue; }
+
         let cid = min(ev.color_id, u.color_count - 1u);
 
         // Pressure injection (Destroy at full strength, Impact at 25%).
-        var rho_inject = arr8(u.inject_densities, cid) * ev.intensity * falloff;
+        var rho_inject = arr8(u.inject_densities, cid) * ev.intensity * mask;
         if ev.event_type == 1u { rho_inject *= 0.25; }
         if rho_inject > 0.001 {
-            inject_equilibrium(cell, 1.0 + rho_inject);
+            let ux = ev.base_vel_x + stamp.g * ev.velocity_scale;
+            let uy = ev.base_vel_y + stamp.b * ev.velocity_scale;
+            if u.injection_mode == 1u {
+                add_injection_delta(cell, rho_inject, ux, uy);
+            } else {
+                set_injection_equilibrium(cell, 1.0 + rho_inject, ux, uy);
+            }
         }
 
         // Colour density injection (Destroy only).
         if ev.event_type == 0u {
-            let color_amount = arr8(u.inject_color_densities, cid) * ev.intensity * falloff;
+            let color_amount = arr8(u.inject_color_densities, cid) * ev.intensity * mask;
             inject_color(cell, cid, color_amount);
         }
     }

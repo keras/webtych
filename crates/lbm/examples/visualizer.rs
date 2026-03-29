@@ -152,6 +152,7 @@ struct AppState {
     block_phase: f32,              // oscillation angle (radians)
     block_speed_ui: f32,           // phase increment per step
     gravity_ui: f32,               // gravity_y fed to sim config
+    additive_injection_ui: bool,
 
     window: Arc<Window>,
 }
@@ -235,8 +236,12 @@ impl ApplicationHandler for App {
                         x,
                         y,
                         intensity: state.intensity_ui,
+                        stamp_radius: 0.6,
                         color_id: 0,
                         kind: EventKind::Destroy,
+                        velocity_scale: 0.06,
+                        base_vel_x: 0.0,
+                        base_vel_y: 0.0,
                     });
                 }
             }
@@ -503,6 +508,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         block_phase: 0.0,
         block_speed_ui: 0.005,
         gravity_ui: 0.0003,
+        additive_injection_ui: true,
         window,
     }
 }
@@ -542,6 +548,9 @@ fn update_and_render(state: &mut AppState) {
         state.sim.config.tau = state.tau_ui;
     }
     state.sim.config.gravity_y = state.gravity_ui;
+    state
+        .sim
+        .set_additive_injection(state.additive_injection_ui);
 
     // ── Advance oscillating block (narrow vertical bar near the bottom) ───
     // The block moves left-right sinusoidally.  Its world velocity is
@@ -588,8 +597,12 @@ fn update_and_render(state: &mut AppState) {
             x: 7.5,
             y: 1.5,
             intensity: state.intensity_ui,
+            stamp_radius: 0.85,
             color_id: 0,
             kind: EventKind::Destroy,
+            velocity_scale: 0.08,
+            base_vel_x: 0.0,
+            base_vel_y: 0.02,
         });
     }
 
@@ -644,6 +657,7 @@ fn update_and_render(state: &mut AppState) {
     let paused_ref = &mut state.paused;
     let gravity_ref = &mut state.gravity_ui;
     let block_speed_ref = &mut state.block_speed_ui;
+    let additive_injection_ref = &mut state.additive_injection_ui;
     let step_count_ref = state.step_count;
     let peak_rho_ref = state.peak_rho;
     let nonambient_ref = state.nonambient;
@@ -668,6 +682,8 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.label("Block speed");
                 ui.add(egui::Slider::new(block_speed_ref, 0.0..=0.025).step_by(0.001));
+
+                ui.checkbox(additive_injection_ref, "Additive injection");
 
                 ui.separator();
                 if ui
@@ -696,6 +712,9 @@ fn update_and_render(state: &mut AppState) {
     if do_reset {
         let cfg = state.sim.config.clone();
         state.sim = Simulation::new(&state.device, cfg);
+        state
+            .sim
+            .set_additive_injection(state.additive_injection_ui);
         let top_cell_h = state.sim.config.world_height / state.sim.config.grid_height as f32;
         state.sim.set_open_boundaries(&[OpenBoundaryPatch {
             x_min: 0.0,

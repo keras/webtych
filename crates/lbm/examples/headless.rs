@@ -63,6 +63,8 @@ fn main() {
             world_width:     world_w,
             world_height:    world_h,
             color_count:     1,
+            gravity_x:       0.0,
+            gravity_y:       0.0,
             effect_profiles: vec![EffectProfile {
                 inject_density:       4.0,
                 inject_color_density: 1.0,
@@ -77,8 +79,12 @@ fn main() {
             x:         world_w / 2.0,
             y:         world_h / 2.0,
             intensity: 1.0,
+            stamp_radius: 0.75,
             color_id:  0,
             kind:      EventKind::Destroy,
+            velocity_scale: 0.05,
+            base_vel_x: 0.0,
+            base_vel_y: 0.0,
         });
 
         // ── run 60 steps ─────────────────────────────────────────────────
