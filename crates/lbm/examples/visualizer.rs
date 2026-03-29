@@ -67,7 +67,41 @@ struct Vis {
 // obstacle texture: R channel = 1.0 for solid cells
 @group(0) @binding(2) var obstacle_tex: texture_2d<f32>;
 
-// Fragment stage: look up density for this pixel and colourise.
+// ── Oklch → linear sRGB ───────────────────────────────────────────────────────
+// Oklch: L = lightness [0,1], C = chroma [0,~0.37], H = hue angle (radians)
+// Hue rotation at constant L and C is perceptually uniform (no brightness shift).
+fn oklch_to_linear_srgb(L: f32, C: f32, H: f32) -> vec3<f32> {
+    let a = C * cos(H);
+    let b = C * sin(H);
+
+    // Oklab → LMS (cube roots)
+    let l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    // LMS → linear sRGB
+    return vec3<f32>(
+         4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    );
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        return 12.92 * c;
+    }
+    return 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+}
+
+// Fragment stage: encode fluid state in Oklch.
+//   Hue       → velocity direction (atan2)
+//   Chroma    → speed  (0 = grey, saturates at ~0.04 LBM units)
+//   Lightness → density (low rho = dark, high rho = bright)
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Map physical pixel → grid cell using actual framebuffer dimensions.
@@ -79,42 +113,43 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let obs = textureLoad(obstacle_tex, vec2<i32>(i32(cx), i32(cy)), 0);
     let solid_frac = obs.r;
     if solid_frac > 0.999 {
-        return vec4<f32>(0.8, obs.g+0.5, obs.b+0.5, 1.0);
+        return vec4<f32>(0.8, obs.g + 0.5, obs.b + 0.5, 1.0);
     }
 
-    // Open-boundary (sink) cells render as semi-transparent green.
+    // Open-boundary (sink) cells render as green.
     if obs.a > 0.5 {
         return vec4<f32>(0.1, 0.8, 0.2, 1.0);
     }
+
     let rho = macro_buf[cell * 3u];
     let ux  = macro_buf[cell * 3u + 1u];
     let uy  = macro_buf[cell * 3u + 2u];
 
-    // Density: rho ~ 1 at rest.  Map [0.95, peak_rho] → [0, 1].
+    // Lightness: density mapped to [0.25, 0.90].
     let hi = max(vis.peak_rho, 1.001);
-    let t   = clamp((rho - 0.95) / (hi - 0.95), 0.0, 1.0);
+    let t = clamp((rho - 0.95) / (hi - 0.95), 0.0, 1.0);
+    let L = 0 + 0.65 * t;
 
-    // Inferno-like colormap from black → purple → red → yellow
-    let c0 = vec3<f32>(0.0,  0.0,  0.0);
-    let c1 = vec3<f32>(0.4,  0.0,  0.6);
-    let c2 = vec3<f32>(0.9,  0.1,  0.0);
-    let c3 = vec3<f32>(1.0,  0.9,  0.1);
-    var rgb: vec3<f32>;
-    if t < 0.333 {
-        rgb = mix(c0, c1, t / 0.333);
-    } else if t < 0.667 {
-        rgb = mix(c1, c2, (t - 0.333) / 0.333);
-    } else {
-        rgb = mix(c2, c3, (t - 0.667) / 0.333);
-    }
-
-    // Overlay velocity as brightness modulation.
+    // Chroma: speed, saturates around 0.04 LBM units.
     let speed = sqrt(ux * ux + uy * uy);
-    let bright = 1.0 + clamp(speed * 2.0, 0.0, 0.5);
-    // Blend fluid color with obstacle grey by PSM fill fraction.
+    let C = clamp(speed * 25.0, 0.0, 0.33);
+
+    // Hue: direction of velocity (atan2 gives [-π, π], that's fine for cos/sin).
+    let H = atan2(uy, ux);
+
+    let linear_rgb = oklch_to_linear_srgb(L, C, H);
+
+    // Gamma-encode and clamp (Oklch can produce small out-of-gamut values).
+    var rgb = vec3<f32>(
+        clamp(linear_to_srgb(linear_rgb.x), 0.0, 1.0),
+        clamp(linear_to_srgb(linear_rgb.y), 0.0, 1.0),
+        clamp(linear_to_srgb(linear_rgb.z), 0.0, 1.0),
+    );
+
+    // Blend fluid colour with obstacle grey by PSM fill fraction.
     let grey = vec3<f32>(0.8, 0.8, 0.85);
-    let out_rgb = mix(rgb * bright, grey, solid_frac);
-    return vec4<f32>(out_rgb, 1.0);
+    rgb = mix(rgb, grey, solid_frac);
+    return vec4<f32>(rgb, 1.0);
 }
 "#;
 
@@ -153,7 +188,7 @@ struct AppState {
     block_speed_ui: f32,           // phase increment per step
     gravity_ui: f32,               // gravity_y fed to sim config
     additive_injection_ui: bool,
-    macroscopic_data: Vec<f32>,    // last readback of [rho, ux, uy] per cell
+    macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
 
     window: Arc<Window>,
 }
