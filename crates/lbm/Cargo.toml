@@ -1,0 +1,28 @@
+[package]
+name = "webtych-lbm"
+version = "0.1.0"
+edition = "2021"
+description = "D2Q9 Lattice Boltzmann fluid simulation running on GPU via wgpu"
+
+[dependencies]
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "29", features = ["webgpu"] }
+
+[dev-dependencies]
+# For running standalone examples/tests on native
+pollster = "0.3"
+env_logger = "0.11"
+wgpu = "29"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+pollster = "0.3"
+env_logger = "0.11"
