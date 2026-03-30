@@ -186,10 +186,14 @@ impl Simulation {
         self.additive_injection = additive;
     }
 
-    /// Advance the simulation by one LBM step.
+    /// Advance the simulation by one logical step.
+    ///
+    /// Internally executes `config.substeps` LBM passes per call.  Events are
+    /// injected only on the first sub-step; subsequent sub-steps run with zero
+    /// events so pressure waves propagate without re-triggering injection.
     ///
     /// 1. Uploads pending events and uniforms.
-    /// 2. Encodes all six compute passes into a command encoder.
+    /// 2. Encodes all six compute passes into a command encoder (× substeps).
     /// 3. Submits to the queue.
     /// 4. Swaps ping-pong buffers.
     pub fn step(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -199,7 +203,9 @@ impl Simulation {
             self.injection_stamp_uploaded = true;
         }
 
-        // Upload events to GPU.
+        let substeps = self.config.substeps.max(1);
+
+        // Upload events to GPU — used only by the first sub-step.
         let event_count = self.pending_events.len() as u32;
         if event_count > 0 {
             let gpu_events: Vec<GpuEvent> =
@@ -212,31 +218,35 @@ impl Simulation {
             self.pending_events.clear();
         }
 
-        // Upload uniforms.
-        let uniforms: LbmUniforms =
-            build_uniforms(&self.config, event_count, self.additive_injection);
-        queue.write_buffer(&self.grid.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        // Build bind group (ping-pong state may have changed since last frame).
-        let bind_group = build_bind_group(device, &self.pipelines.bind_group_layout, &self.grid);
-
-        // Encode and submit compute passes.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("lbm::step"),
         });
 
-        encode_lbm_passes(
-            &mut encoder,
-            &self.pipelines,
-            &bind_group,
-            self.config.grid_width,
-            self.config.grid_height,
-        );
+        for sub in 0..substeps {
+            // After the first sub-step, suppress event injection.
+            let active_events = if sub == 0 { event_count } else { 0 };
+
+            let uniforms: LbmUniforms =
+                build_uniforms(&self.config, active_events, self.additive_injection);
+            queue.write_buffer(&self.grid.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+            // Build bind group (ping-pong state changes each sub-step).
+            let bind_group =
+                build_bind_group(device, &self.pipelines.bind_group_layout, &self.grid);
+
+            encode_lbm_passes(
+                &mut encoder,
+                &self.pipelines,
+                &bind_group,
+                self.config.grid_width,
+                self.config.grid_height,
+            );
+
+            // After streaming, the dst buffer is the authoritative state.
+            self.grid.swap();
+        }
 
         queue.submit(std::iter::once(encoder.finish()));
-
-        // After streaming, the dst buffer is the authoritative state.
-        self.grid.swap();
     }
 
     // ── Accessors for renderer integration ─────────────────────────────────

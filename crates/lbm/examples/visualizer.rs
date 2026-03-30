@@ -188,6 +188,7 @@ struct AppState {
     block_speed_ui: f32,           // phase increment per step
     gravity_ui: f32,               // gravity_y fed to sim config
     additive_injection_ui: bool,
+    substeps_ui: u32,
     macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
 
     window: Arc<Window>,
@@ -380,6 +381,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         world_width: 10.0,
         world_height: 15.0, // portrait 2:3 world matching the 128×192 grid
         color_count: 1,
+        substeps: 1,
         gravity_x: 0.0,
         gravity_y: 0.0003, // default: gentle downward pull
         effect_profiles: vec![EffectProfile {
@@ -544,6 +546,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         block_speed_ui: 0.005,
         gravity_ui: 0.0003,
         additive_injection_ui: true,
+        substeps_ui: 1,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
         window,
     }
@@ -584,6 +587,7 @@ fn update_and_render(state: &mut AppState) {
         state.sim.config.tau = state.tau_ui;
     }
     state.sim.config.gravity_y = state.gravity_ui;
+    state.sim.config.substeps = state.substeps_ui;
     state
         .sim
         .set_additive_injection(state.additive_injection_ui);
@@ -696,6 +700,7 @@ fn update_and_render(state: &mut AppState) {
     let gravity_ref = &mut state.gravity_ui;
     let block_speed_ref = &mut state.block_speed_ui;
     let additive_injection_ref = &mut state.additive_injection_ui;
+    let substeps_ref = &mut state.substeps_ui;
     let step_count_ref = state.step_count;
     let peak_rho_ref = state.peak_rho;
     let nonambient_ref = state.nonambient;
@@ -720,6 +725,9 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.label("Block speed");
                 ui.add(egui::Slider::new(block_speed_ref, 0.0..=0.025).step_by(0.001));
+
+                ui.label("Substeps");
+                ui.add(egui::Slider::new(substeps_ref, 1..=8).step_by(1.0));
 
                 ui.checkbox(additive_injection_ref, "Additive injection");
 

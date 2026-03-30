@@ -42,6 +42,13 @@ pub struct SimConfig {
     /// Per-colour effect profiles (length must equal `color_count`).
     pub effect_profiles: Vec<EffectProfile>,
 
+    /// Number of LBM steps executed per [`Simulation::step`] call.
+    ///
+    /// Each extra sub-step effectively multiplies the speed of sound (and all
+    /// advection speeds) by `substeps` in physical / visual terms, at the cost
+    /// of `substeps × GPU time per frame`.  Default is 1 (no sub-stepping).
+    pub substeps: u32,
+
     /// Gravity body-force acceleration (lattice units / step).
     /// Positive values pull toward +X / +Y (right / bottom of screen).
     pub gravity_x: f32,
@@ -67,6 +74,7 @@ impl SimConfig {
             world_height,
             color_count,
             effect_profiles: (0..color_count).map(|_| EffectProfile::default()).collect(),
+            substeps: 1,
             gravity_x: 0.0,
             gravity_y: 0.0,
         }
