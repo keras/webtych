@@ -343,6 +343,10 @@ pub fn rasterise_obstacles(
     let cell_w = config.world_width / config.grid_width as f32;
     let cell_h = config.world_height / config.grid_height as f32;
 
+    // Each sub-step covers 1/substeps of the frame interval, so the per-step
+    // wall velocity must be scaled down accordingly.
+    let vel_scale = 1.0 / config.substeps.max(1) as f32;
+
     for patch in patches {
         // Convert world-space bounds to grid-space integer cells.
         let gx_min = ((patch.x_min / config.world_width) * config.grid_width as f32).floor() as i32;
@@ -375,8 +379,8 @@ pub fn rasterise_obstacles(
                     let ob = out[gy * w + gx].open_boundary;
                     out[gy * w + gx] = ObstacleTexel {
                         mask: fraction,
-                        vel_x: patch.vel_x,
-                        vel_y: patch.vel_y,
+                        vel_x: patch.vel_x * vel_scale,
+                        vel_y: patch.vel_y * vel_scale,
                         open_boundary: ob,
                     };
                 }

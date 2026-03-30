@@ -157,7 +157,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // PSM blend: mix existing streamed value with full bounce-back by fill fraction.
         // s=1 → full moving bounce-back; s→0 → no boundary effect.
-        let f_bb  = f_incoming - correction;
+        let f_bb  = max(f_incoming - correction, 0.0);
         let opp_j = OPPOSITE[j];
         dist_dst[dist_idx(fluid_cell, opp_j)] = mix(
             dist_dst[dist_idx(fluid_cell, opp_j)],

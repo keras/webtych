@@ -190,6 +190,7 @@ struct AppState {
     additive_injection_ui: bool,
     substeps_ui: u32,
     macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
+    max_speed: f32,             // maximum fluid speed observed in the last readback
 
     window: Arc<Window>,
 }
@@ -548,6 +549,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         additive_injection_ui: true,
         substeps_ui: 1,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
+        max_speed: 0.0,
         window,
     }
 }
@@ -704,6 +706,7 @@ fn update_and_render(state: &mut AppState) {
     let step_count_ref = state.step_count;
     let peak_rho_ref = state.peak_rho;
     let nonambient_ref = state.nonambient;
+    let max_speed_ref = state.max_speed;
     let sim_tau_ref = state.sim.config.tau;
     let mut do_reset = false;
 
@@ -745,6 +748,7 @@ fn update_and_render(state: &mut AppState) {
                 ui.separator();
                 ui.label(format!("Step : {step_count_ref}"));
                 ui.label(format!("Peak ρ : {peak_rho_ref:.4}"));
+                ui.label(format!("Max speed : {max_speed_ref:.5}"));
                 ui.label(format!("Non-ambient cells : {nonambient_ref}"));
                 ui.label(format!("Grid : {}×{}", GRID_W, GRID_H));
                 ui.label(format!("τ (active) : {sim_tau_ref:.3}"));
@@ -795,6 +799,7 @@ fn update_and_render(state: &mut AppState) {
         state.step_count = 0;
         state.peak_rho = 1.0;
         state.nonambient = 0;
+        state.max_speed = 0.0;
         state.block_phase = 0.0;
     }
 
@@ -923,17 +928,25 @@ fn do_readback(state: &mut AppState) {
         let n = (GRID_W * GRID_H) as usize;
         let mut peak = 0.0_f32;
         let mut na = 0u32;
+        let mut max_speed = 0.0_f32;
         for cell in 0..n {
             let rho = data[cell * 3];
+            let ux = data[cell * 3 + 1];
+            let uy = data[cell * 3 + 2];
             if rho > peak {
                 peak = rho;
             }
             if (rho - 1.0).abs() > 0.01 {
                 na += 1;
             }
+            let speed = (ux * ux + uy * uy).sqrt();
+            if speed > max_speed {
+                max_speed = speed;
+            }
         }
         state.peak_rho = peak;
         state.nonambient = na;
+        state.max_speed = max_speed;
         state.macroscopic_data = data;
     }
 }
