@@ -375,6 +375,8 @@ pub fn rasterise_obstacles(
                     let ox = (patch.x_max.min(cell_x_hi) - patch.x_min.max(cell_x_lo)).max(0.0);
                     let oy = (patch.y_max.min(cell_y_hi) - patch.y_min.max(cell_y_lo)).max(0.0);
                     let fraction = (ox / cell_w) * (oy / cell_h);
+                    // Inset mode: skip cells that aren't fully inside the geometry.
+                    if patch.inset && fraction < 1.0 { continue; }
                     if fraction > out[gy * w + gx].mask {
                         let ob = out[gy * w + gx].open_boundary;
                         out[gy * w + gx] = ObstacleTexel {
@@ -412,6 +414,7 @@ pub fn rasterise_obstacles(
             // 4×4 stratified sample grid inside each cell.
             const N: usize = 4;
             const INV_N: f32 = 1.0 / N as f32;
+            const N_SAMPLES: u32 = (N * N) as u32;
 
             for gy in gy_min..gy_max {
                 for gx in gx_min..gx_max {
@@ -432,7 +435,9 @@ pub fn rasterise_obstacles(
                             }
                         }
                     }
-                    let fraction = hits as f32 / (N * N) as f32;
+                    // Inset mode: skip cells that aren't fully inside the geometry.
+                    if patch.inset && hits < N_SAMPLES { continue; }
+                    let fraction = hits as f32 / N_SAMPLES as f32;
                     if fraction > out[gy * w + gx].mask {
                         let ob = out[gy * w + gx].open_boundary;
                         out[gy * w + gx] = ObstacleTexel {

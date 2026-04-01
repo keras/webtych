@@ -32,6 +32,20 @@ pub struct ObstaclePatch {
     /// Clockwise rotation in radians around the rectangle centre.  Use `0.0` for
     /// axis-aligned patches.
     pub rotation: f32,
+    /// Controls which side of the geometric boundary the rasterised solid region
+    /// falls on.
+    ///
+    /// * `false` (default / "outside"): edge cells that are only partially covered
+    ///   are written with their fractional mask value.  The effective solid region
+    ///   extends to the outermost touched cells, creating a thin fringe of partial
+    ///   obstacles just outside the geometry.
+    /// * `true` ("inset"): only cells whose coverage fraction equals 1.0 are
+    ///   written as solid; partially-covered edge cells stay fluid.  The solid
+    ///   region is strictly inside the geometric boundary, eliminating the fringe.
+    ///
+    /// Use `inset: true` for game blocks so smoke can flow right up to the block
+    /// edges without being pushed away by partial-solid fringe cells.
+    pub inset: bool,
 }
 
 /// One texel of the obstacle texture uploaded to the GPU each frame.

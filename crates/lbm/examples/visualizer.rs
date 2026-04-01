@@ -643,6 +643,7 @@ fn update_and_render(state: &mut AppState) {
                 vel_x: block_vel_l,
                 vel_y: 0.0,
                 rotation: 0.0,
+                inset: false,
             },
             ObstaclePatch {
                 // solid floor so injected density pools visibly
@@ -653,6 +654,7 @@ fn update_and_render(state: &mut AppState) {
                 vel_x: 0.0,
                 vel_y: 0.0,
                 rotation: 0.0,
+                inset: false,
             },
         ],
     );
