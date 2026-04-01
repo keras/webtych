@@ -168,6 +168,7 @@ impl ScoreState {
         // Each level reduces the interval by 10%, capping at 3× speed.
         (1.0 - (self.level.saturating_sub(1) as f32) * 0.1).max(0.33)
     }
+
 }
 
 #[cfg(test)]

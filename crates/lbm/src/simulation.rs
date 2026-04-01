@@ -218,17 +218,19 @@ impl Simulation {
             self.pending_events.clear();
         }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("lbm::step"),
-        });
-
         for sub in 0..substeps {
             // After the first sub-step, suppress event injection.
             let active_events = if sub == 0 { event_count } else { 0 };
 
             let uniforms: LbmUniforms =
                 build_uniforms(&self.config, active_events, self.additive_injection);
+            // write_buffer must be followed by a submit before the next write_buffer
+            // so each sub-step's GPU passes see the correct uniform values.
             queue.write_buffer(&self.grid.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lbm::step"),
+            });
 
             // Build bind group (ping-pong state changes each sub-step).
             let bind_group =
@@ -242,11 +244,11 @@ impl Simulation {
                 self.config.grid_height,
             );
 
+            queue.submit(std::iter::once(encoder.finish()));
+
             // After streaming, the dst buffer is the authoritative state.
             self.grid.swap();
         }
-
-        queue.submit(std::iter::once(encoder.finish()));
     }
 
     // ── Accessors for renderer integration ─────────────────────────────────
