@@ -7,6 +7,6 @@ pub mod trimino;
 
 pub use board::Board;
 pub use events::GameEvent;
-pub use physics::BlockInstance;
+pub use physics::{BlockInstance, CellInfo};
 pub use state::{GameState, InputAction};
 pub use trimino::{ColorId, ColorPalette};

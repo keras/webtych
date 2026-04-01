@@ -10,7 +10,8 @@ use winit::{
 };
 
 use renderer::Renderer;
-use webtych_game::{GameState, InputAction};
+use webtych_game::{GameEvent, GameState, InputAction};
+use webtych_lbm::{EventKind, InjectionEvent, ObstaclePatch};
 
 // On WASM the GPU init is async; we hand a shared slot to spawn_local
 // and poll it from the event handler until it's ready.
@@ -85,6 +86,85 @@ fn map_key(key: KeyCode) -> Option<InputAction> {
         KeyCode::Space => Some(InputAction::HardDrop),
         _ => None,
     }
+}
+
+/// Build LBM obstacle patches from physics cell positions and static walls.
+fn build_obstacle_patches(game: &GameState) -> Vec<ObstaclePatch> {
+    let half = 0.475;
+    // The LBM boundary shader expects obstacle velocity in lattice units (~0.1 max).
+    // Rapier linvel is in world units/s which can reach 20-40 — far above the
+    // stability limit.  Zero the velocity for now; blocks still act as moving
+    // solid obstacles via their changing AABB each frame.
+    let mut obstacles: Vec<ObstaclePatch> = game
+        .physics
+        .cell_infos()
+        .iter()
+        .map(|info| ObstaclePatch {
+            x_min: info.position.x - half,
+            y_min: info.position.y - half,
+            x_max: info.position.x + half,
+            y_max: info.position.y + half,
+            vel_x: 0.0,
+            vel_y: 0.0,
+        })
+        .collect();
+
+    // The wall patches below are outside the LBM domain (grid covers 0..10, 0..20)
+    // so they get clamped to nothing — the grid edges already act as no-slip walls.
+    // Kept here for clarity if world/grid extents change later.
+    obstacles.push(ObstaclePatch {
+        x_min: -1.0, y_min: -1.0, x_max: 11.0, y_max: 0.0,
+        vel_x: 0.0, vel_y: 0.0,
+    });
+    obstacles.push(ObstaclePatch {
+        x_min: -1.0, y_min: 0.0, x_max: 0.0, y_max: 20.0,
+        vel_x: 0.0, vel_y: 0.0,
+    });
+    obstacles.push(ObstaclePatch {
+        x_min: 10.0, y_min: 0.0, x_max: 11.0, y_max: 20.0,
+        vel_x: 0.0, vel_y: 0.0,
+    });
+
+    obstacles
+}
+
+/// Convert game events into LBM injection events.
+fn build_injection_events(events: &[GameEvent]) -> Vec<InjectionEvent> {
+    let mut injections = Vec::new();
+    for event in events {
+        match event {
+            GameEvent::Destroy { cells, color } => {
+                for pos in cells {
+                    injections.push(InjectionEvent {
+                        x: pos[0],
+                        y: pos[1],
+                        intensity: 1.0,
+                        stamp_radius: 0.6,
+                        color_id: color.id(),
+                        kind: EventKind::Destroy,
+                        velocity_scale: 0.05,
+                        base_vel_x: 0.0,
+                        base_vel_y: 0.0,
+                    });
+                }
+            }
+            GameEvent::Impact { position, velocity } => {
+                injections.push(InjectionEvent {
+                    x: position[0],
+                    y: position[1],
+                    intensity: (velocity / 20.0).min(1.0),
+                    stamp_radius: 0.4,
+                    color_id: 0,
+                    kind: EventKind::Impact,
+                    velocity_scale: 0.02,
+                    base_vel_x: 0.0,
+                    base_vel_y: -velocity * 0.01,
+                });
+            }
+            _ => {}
+        }
+    }
+    injections
 }
 
 impl ApplicationHandler for App {
@@ -196,7 +276,13 @@ impl ApplicationHandler for App {
                 renderer.resize(size);
             }
             WindowEvent::RedrawRequested => {
-                if let Some(game) = self.game_state.as_ref() {
+                if let Some(game) = self.game_state.as_mut() {
+                    // Feed physics bodies and game events to the fluid simulation.
+                    let obstacles = build_obstacle_patches(game);
+                    let game_events = game.drain_events();
+                    let injections = build_injection_events(&game_events);
+                    renderer.update_fluid(&obstacles, injections);
+
                     let instances = game.block_instances();
                     renderer.update_instances(&instances);
                 }

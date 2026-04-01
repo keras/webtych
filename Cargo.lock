@@ -3269,6 +3269,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webtych-game",
+ "webtych-lbm",
  "wgpu",
  "winit",
 ]

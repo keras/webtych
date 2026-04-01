@@ -16,6 +16,7 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 webtych-game = { path = "../game" }
+webtych-lbm = { path = "../lbm" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "29", features = ["webgpu"] }

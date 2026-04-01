@@ -4,6 +4,7 @@ use winit::window::Window;
 
 use webtych_game::physics::BlockInstance;
 use webtych_game::ColorPalette;
+use webtych_lbm::{InjectionEvent, ObstaclePatch, OpenBoundaryPatch, SimConfig, Simulation};
 
 // ── WGSL shader ───────────────────────────────────────────────────────────────
 
@@ -95,6 +96,74 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+// ── Smoke bake compute shader ─────────────────────────────────────────────────
+
+const SMOKE_BAKE_SHADER: &str = r#"
+struct SmokeBakeUniforms {
+    grid_width:  u32,
+    grid_height: u32,
+    color_count: u32,
+    _pad:        u32,
+    colors: array<vec4<f32>, 16>,
+}
+
+@group(0) @binding(0) var<uniform> u: SmokeBakeUniforms;
+// macroscopic buffer: [rho, ux, uy] per cell
+@group(0) @binding(1) var<storage, read> macro_buf: array<f32>;
+@group(0) @binding(2) var smoke_out: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= u.grid_width || gid.y >= u.grid_height {
+        return;
+    }
+    let cell = gid.y * u.grid_width + gid.x;
+
+    let rho = macro_buf[cell * 3u];
+    let ux  = macro_buf[cell * 3u + 1u];
+    let uy  = macro_buf[cell * 3u + 2u];
+
+    // Overpressure: red. Underpressure: blue. Velocity: green.
+    let scale = 8.0;
+    let r = clamp((rho - 1.0) * scale, 0.0, 1.0);
+    let b = clamp((1.0 - rho) * scale, 0.0, 1.0);
+    let g = clamp(sqrt(ux * ux + uy * uy) * 40.0, 0.0, 1.0);
+    let a = clamp(r + g + b, 0.0, 1.0);
+
+    textureStore(smoke_out, vec2<i32>(gid.xy), vec4<f32>(r, g, b, a));
+}
+"#;
+
+// ── Smoke render shader ──────────────────────────────────────────────────────
+
+const SMOKE_RENDER_SHADER: &str = r#"
+struct Camera {
+    projection: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var smoke_tex:  texture_2d<f32>;
+@group(0) @binding(2) var smoke_samp: sampler;
+
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0)       uv:       vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) vert_pos: vec2<f32>) -> VOut {
+    var out: VOut;
+    out.clip_pos = camera.projection * vec4<f32>(vert_pos, 0.0, 1.0);
+    out.uv = vert_pos / vec2<f32>(10.0, 20.0);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    let smoke = textureSample(smoke_tex, smoke_samp, in.uv);
+    return vec4<f32>(smoke.rgb, smoke.a * 0.85);
+}
+"#;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -149,6 +218,20 @@ impl GpuPalette {
     }
 }
 
+// ── Smoke bake uniforms ─────────────────────────────────────────────────────
+
+/// GPU uniform for the smoke bake compute pass.
+/// Must match the WGSL `SmokeBakeUniforms` struct exactly.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SmokeBakeUniforms {
+    grid_width: u32,
+    grid_height: u32,
+    color_count: u32,
+    _pad: u32,
+    colors: [[f32; 4]; MAX_PALETTE_COLORS],
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
@@ -170,6 +253,20 @@ pub struct Renderer {
     board_pipeline: wgpu::RenderPipeline,
     board_vertex_buf: wgpu::Buffer,
     board_index_buf: wgpu::Buffer,
+    // LBM fluid simulation
+    simulation: Simulation,
+    // Smoke bake compute pass (texture + uniform kept alive for GPU references)
+    #[allow(dead_code)]
+    smoke_texture: wgpu::Texture,
+    #[allow(dead_code)]
+    smoke_texture_view: wgpu::TextureView,
+    smoke_bake_pipeline: wgpu::ComputePipeline,
+    smoke_bake_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
+    smoke_bake_uniform_buf: wgpu::Buffer,
+    // Smoke render pass
+    smoke_render_pipeline: wgpu::RenderPipeline,
+    smoke_render_bind_group: wgpu::BindGroup,
 }
 
 /// Orthographic projection matrix for a 2D view.
@@ -489,6 +586,251 @@ impl Renderer {
             usage:    wgpu::BufferUsages::INDEX,
         });
 
+        // ── LBM simulation ──────────────────────────────────────────────
+        let color_count = palette.len();
+        let sim_config = SimConfig::for_game_board(10.0, 20.0, color_count);
+        let grid_width = sim_config.grid_width;
+        let grid_height = sim_config.grid_height;
+        let mut simulation = Simulation::new(&device, sim_config);
+
+        // Open boundaries on all four edges — pressure/smoke can drain out
+        // rather than piling up and driving the simulation unstable.
+        let b = 20.0 / 256.0 * 2.0; // ~2 grid cells
+        simulation.set_open_boundaries(&[
+            OpenBoundaryPatch { x_min: 0.0,      y_min: 20.0 - b, x_max: 10.0,     y_max: 20.0 }, // top
+            OpenBoundaryPatch { x_min: 0.0,      y_min: 0.0,      x_max: 10.0,     y_max: b    }, // bottom
+            OpenBoundaryPatch { x_min: 0.0,      y_min: 0.0,      x_max: b,        y_max: 20.0 }, // left
+            OpenBoundaryPatch { x_min: 10.0 - b, y_min: 0.0,      x_max: 10.0,     y_max: 20.0 }, // right
+        ]);
+
+        // ── Smoke texture (output of bake, input to render) ─────────────
+        let smoke_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("smoke_texture"),
+            size: wgpu::Extent3d {
+                width: grid_width,
+                height: grid_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let smoke_texture_view =
+            smoke_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // ── Smoke bake compute pipeline ─────────────────────────────────
+        let smoke_bake_uniforms = SmokeBakeUniforms {
+            grid_width,
+            grid_height,
+            color_count,
+            _pad: 0,
+            colors: gpu_palette.colors,
+        };
+        let smoke_bake_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("smoke_bake_uniforms"),
+            contents: bytemuck::cast_slice(&[smoke_bake_uniforms]),
+            usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let smoke_bake_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label:   Some("smoke_bake bgl"),
+            entries: &[
+                // 0: uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding:    0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                },
+                // 1: color_densities (read-only storage)
+                wgpu::BindGroupLayoutEntry {
+                    binding:    1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                },
+                // 2: smoke output texture (write-only storage)
+                wgpu::BindGroupLayoutEntry {
+                    binding:    2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access:         wgpu::StorageTextureAccess::WriteOnly,
+                        format:         wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let smoke_bake_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:  Some("smoke_bake bg"),
+            layout: &smoke_bake_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: smoke_bake_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: simulation.macroscopic_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  2,
+                    resource: wgpu::BindingResource::TextureView(&smoke_texture_view),
+                },
+            ],
+        });
+
+        let smoke_bake_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("smoke bake shader"),
+            source: wgpu::ShaderSource::Wgsl(SMOKE_BAKE_SHADER.into()),
+        });
+
+        let smoke_bake_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label:              Some("smoke_bake layout"),
+                bind_group_layouts: &[Some(&smoke_bake_bgl)],
+                immediate_size:     0,
+            });
+
+        let smoke_bake_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label:              Some("smoke_bake pipeline"),
+                layout:             Some(&smoke_bake_pipeline_layout),
+                module:             &smoke_bake_shader,
+                entry_point:        Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache:              None,
+            });
+
+        // ── Smoke render pipeline ───────────────────────────────────────
+        let smoke_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label:           Some("smoke_sampler"),
+            address_mode_u:  wgpu::AddressMode::ClampToEdge,
+            address_mode_v:  wgpu::AddressMode::ClampToEdge,
+            mag_filter:      wgpu::FilterMode::Linear,
+            min_filter:      wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let smoke_render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label:   Some("smoke_render bgl"),
+            entries: &[
+                // 0: camera
+                wgpu::BindGroupLayoutEntry {
+                    binding:    0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                },
+                // 1: smoke texture
+                wgpu::BindGroupLayoutEntry {
+                    binding:    1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled:   false,
+                    },
+                    count: None,
+                },
+                // 2: sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding:    2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let smoke_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:  Some("smoke_render bg"),
+            layout: &smoke_render_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: camera_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: wgpu::BindingResource::TextureView(&smoke_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  2,
+                    resource: wgpu::BindingResource::Sampler(&smoke_sampler),
+                },
+            ],
+        });
+
+        let smoke_render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("smoke render shader"),
+            source: wgpu::ShaderSource::Wgsl(SMOKE_RENDER_SHADER.into()),
+        });
+
+        let smoke_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label:              Some("smoke_render layout"),
+                bind_group_layouts: &[Some(&smoke_render_bgl)],
+                immediate_size:     0,
+            });
+
+        let smoke_render_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode:    wgpu::VertexStepMode::Vertex,
+            attributes:   &[wgpu::VertexAttribute {
+                format:          wgpu::VertexFormat::Float32x2,
+                offset:          0,
+                shader_location: 0,
+            }],
+        };
+
+        let smoke_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label:  Some("smoke_render pipeline"),
+                layout: Some(&smoke_render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module:              &smoke_render_shader,
+                    entry_point:         Some("vs_main"),
+                    buffers:             &[smoke_render_vertex_layout],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module:              &smoke_render_shader,
+                    entry_point:         Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend:      Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample:   wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache:         None,
+            });
+
         Self {
             surface,
             device,
@@ -505,6 +847,14 @@ impl Renderer {
             board_pipeline,
             board_vertex_buf,
             board_index_buf,
+            simulation,
+            smoke_texture,
+            smoke_texture_view,
+            smoke_bake_pipeline,
+            smoke_bake_bind_group,
+            smoke_bake_uniform_buf,
+            smoke_render_pipeline,
+            smoke_render_bind_group,
         }
     }
 
@@ -576,6 +926,20 @@ impl Renderer {
         self.queue.write_buffer(&self.instance_buf, 0, data);
     }
 
+    /// Feed obstacle patches and injection events to the fluid simulation.
+    /// Call once per frame after game.update(), before render().
+    pub fn update_fluid(
+        &mut self,
+        obstacles: &[ObstaclePatch],
+        events: Vec<InjectionEvent>,
+    ) {
+        self.simulation.set_obstacles(&self.queue, obstacles);
+        for event in events {
+            self.simulation.push_event(event);
+        }
+        self.simulation.step(&self.device, &self.queue);
+    }
+
     pub fn render(&self) -> Result<(), RenderError> {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -596,6 +960,20 @@ impl Renderer {
             label: Some("frame"),
         });
 
+        // ── Smoke bake compute pass ─────────────────────────────────────
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("smoke bake"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.smoke_bake_pipeline);
+            pass.set_bind_group(0, &self.smoke_bake_bind_group, &[]);
+            let wg_x = self.simulation.config.grid_width.div_ceil(16);
+            let wg_y = self.simulation.config.grid_height.div_ceil(16);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // ── Main render pass ────────────────────────────────────────────
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
@@ -622,6 +1000,13 @@ impl Renderer {
             // Draw board background.
             pass.set_pipeline(&self.board_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.board_vertex_buf.slice(..));
+            pass.set_index_buffer(self.board_index_buf.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..6, 0, 0..1);
+
+            // Draw smoke (alpha blended over the board).
+            pass.set_pipeline(&self.smoke_render_pipeline);
+            pass.set_bind_group(0, &self.smoke_render_bind_group, &[]);
             pass.set_vertex_buffer(0, self.board_vertex_buf.slice(..));
             pass.set_index_buffer(self.board_index_buf.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..6, 0, 0..1);
