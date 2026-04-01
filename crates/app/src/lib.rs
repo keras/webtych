@@ -106,6 +106,7 @@ fn build_obstacle_patches(game: &GameState) -> Vec<ObstaclePatch> {
             y_max: info.position.y + half,
             vel_x: 0.0,
             vel_y: 0.0,
+            rotation: info.rotation,
         })
         .collect();
 
@@ -114,15 +115,15 @@ fn build_obstacle_patches(game: &GameState) -> Vec<ObstaclePatch> {
     // Kept here for clarity if world/grid extents change later.
     obstacles.push(ObstaclePatch {
         x_min: -1.0, y_min: -1.0, x_max: 11.0, y_max: 0.0,
-        vel_x: 0.0, vel_y: 0.0,
+        vel_x: 0.0, vel_y: 0.0, rotation: 0.0,
     });
     obstacles.push(ObstaclePatch {
         x_min: -1.0, y_min: 0.0, x_max: 0.0, y_max: 20.0,
-        vel_x: 0.0, vel_y: 0.0,
+        vel_x: 0.0, vel_y: 0.0, rotation: 0.0,
     });
     obstacles.push(ObstaclePatch {
         x_min: 10.0, y_min: 0.0, x_max: 11.0, y_max: 20.0,
-        vel_x: 0.0, vel_y: 0.0,
+        vel_x: 0.0, vel_y: 0.0, rotation: 0.0,
     });
 
     obstacles

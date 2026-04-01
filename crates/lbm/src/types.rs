@@ -9,24 +9,29 @@ use bytemuck::{Pod, Zeroable};
 // Obstacle
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// An axis-aligned rectangular obstacle patch to be rasterised into the
+/// A rectangular obstacle patch (optionally rotated) to be rasterised into the
 /// obstacle texture before each simulation step.
 ///
-/// Match the game's coordinate system: origin bottom-left, Y-up.
-/// The simulation will convert these to grid coordinates via [`SimConfig::world_to_grid`].
+/// `x_min/y_min/x_max/y_max` are the bounds of the **unrotated** rectangle in
+/// world-space (origin bottom-left, Y-up).  `rotation` is the clockwise angle in
+/// radians applied around the rectangle's centre.  Pass `rotation: 0.0` for
+/// axis-aligned patches (uses a fast AABB path internally).
 #[derive(Debug, Clone, Copy)]
 pub struct ObstaclePatch {
-    /// Left edge in world-space.
+    /// Left edge of the unrotated rectangle in world-space.
     pub x_min: f32,
-    /// Bottom edge in world-space.
+    /// Bottom edge of the unrotated rectangle in world-space.
     pub y_min: f32,
-    /// Right edge in world-space.
+    /// Right edge of the unrotated rectangle in world-space.
     pub x_max: f32,
-    /// Top edge in world-space.
+    /// Top edge of the unrotated rectangle in world-space.
     pub y_max: f32,
     /// Obstacle velocity (world-space units / s) for moving bounce-back.
     pub vel_x: f32,
     pub vel_y: f32,
+    /// Clockwise rotation in radians around the rectangle centre.  Use `0.0` for
+    /// axis-aligned patches.
+    pub rotation: f32,
 }
 
 /// One texel of the obstacle texture uploaded to the GPU each frame.

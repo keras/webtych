@@ -348,41 +348,100 @@ pub fn rasterise_obstacles(
     let vel_scale = 1.0 / config.substeps.max(1) as f32;
 
     for patch in patches {
-        // Convert world-space bounds to grid-space integer cells.
-        let gx_min = ((patch.x_min / config.world_width) * config.grid_width as f32).floor() as i32;
-        let gx_max = ((patch.x_max / config.world_width) * config.grid_width as f32).ceil() as i32;
-        let gy_min =
-            ((patch.y_min / config.world_height) * config.grid_height as f32).floor() as i32;
-        let gy_max =
-            ((patch.y_max / config.world_height) * config.grid_height as f32).ceil() as i32;
+        // OBB centre and half-extents in world-space.
+        let cx = (patch.x_min + patch.x_max) * 0.5;
+        let cy = (patch.y_min + patch.y_max) * 0.5;
+        let hx = (patch.x_max - patch.x_min) * 0.5;
+        let hy = (patch.y_max - patch.y_min) * 0.5;
 
-        // Clamp to grid bounds.
-        let gx_min = gx_min.max(0) as usize;
-        let gx_max = gx_max.min(config.grid_width as i32) as usize;
-        let gy_min = gy_min.max(0) as usize;
-        let gy_max = gy_max.min(config.grid_height as i32) as usize;
+        if patch.rotation == 0.0 {
+            // ── Fast AABB path ──────────────────────────────────────────────
+            let gx_min = ((patch.x_min / config.world_width) * config.grid_width as f32).floor() as i32;
+            let gx_max = ((patch.x_max / config.world_width) * config.grid_width as f32).ceil() as i32;
+            let gy_min = ((patch.y_min / config.world_height) * config.grid_height as f32).floor() as i32;
+            let gy_max = ((patch.y_max / config.world_height) * config.grid_height as f32).ceil() as i32;
 
-        for gy in gy_min..gy_max {
-            for gx in gx_min..gx_max {
-                // Compute the area-overlap fraction (PSM fill fraction).
-                // This is the proportion of this grid cell covered by the patch’s rectangle.
-                let cx_lo = gx as f32 * cell_w;
-                let cx_hi = cx_lo + cell_w;
-                let cy_lo = gy as f32 * cell_h;
-                let cy_hi = cy_lo + cell_h;
-                let ox = (patch.x_max.min(cx_hi) - patch.x_min.max(cx_lo)).max(0.0);
-                let oy = (patch.y_max.min(cy_hi) - patch.y_min.max(cy_lo)).max(0.0);
-                let fraction = (ox / cell_w) * (oy / cell_h);
-                // Keep the velocity of whichever patch has the highest coverage.
-                if fraction > out[gy * w + gx].mask {
-                    // Preserve open_boundary flag — it is set independently.
-                    let ob = out[gy * w + gx].open_boundary;
-                    out[gy * w + gx] = ObstacleTexel {
-                        mask: fraction,
-                        vel_x: patch.vel_x * vel_scale,
-                        vel_y: patch.vel_y * vel_scale,
-                        open_boundary: ob,
-                    };
+            let gx_min = gx_min.max(0) as usize;
+            let gx_max = gx_max.min(config.grid_width as i32) as usize;
+            let gy_min = gy_min.max(0) as usize;
+            let gy_max = gy_max.min(config.grid_height as i32) as usize;
+
+            for gy in gy_min..gy_max {
+                for gx in gx_min..gx_max {
+                    let cell_x_lo = gx as f32 * cell_w;
+                    let cell_x_hi = cell_x_lo + cell_w;
+                    let cell_y_lo = gy as f32 * cell_h;
+                    let cell_y_hi = cell_y_lo + cell_h;
+                    let ox = (patch.x_max.min(cell_x_hi) - patch.x_min.max(cell_x_lo)).max(0.0);
+                    let oy = (patch.y_max.min(cell_y_hi) - patch.y_min.max(cell_y_lo)).max(0.0);
+                    let fraction = (ox / cell_w) * (oy / cell_h);
+                    if fraction > out[gy * w + gx].mask {
+                        let ob = out[gy * w + gx].open_boundary;
+                        out[gy * w + gx] = ObstacleTexel {
+                            mask: fraction,
+                            vel_x: patch.vel_x * vel_scale,
+                            vel_y: patch.vel_y * vel_scale,
+                            open_boundary: ob,
+                        };
+                    }
+                }
+            }
+        } else {
+            // ── OBB path: multi-sample coverage ────────────────────────────
+            // Precompute trig for rotating sample points into OBB local space.
+            let (sin_r, cos_r) = patch.rotation.sin_cos();
+
+            // AABB of the OBB — used to limit candidate cells.
+            let aabb_hw = hx * cos_r.abs() + hy * sin_r.abs();
+            let aabb_hh = hx * sin_r.abs() + hy * cos_r.abs();
+            let aabb_x_min = cx - aabb_hw;
+            let aabb_x_max = cx + aabb_hw;
+            let aabb_y_min = cy - aabb_hh;
+            let aabb_y_max = cy + aabb_hh;
+
+            let gx_min = ((aabb_x_min / config.world_width) * config.grid_width as f32).floor() as i32;
+            let gx_max = ((aabb_x_max / config.world_width) * config.grid_width as f32).ceil() as i32;
+            let gy_min = ((aabb_y_min / config.world_height) * config.grid_height as f32).floor() as i32;
+            let gy_max = ((aabb_y_max / config.world_height) * config.grid_height as f32).ceil() as i32;
+
+            let gx_min = gx_min.max(0) as usize;
+            let gx_max = gx_max.min(config.grid_width as i32) as usize;
+            let gy_min = gy_min.max(0) as usize;
+            let gy_max = gy_max.min(config.grid_height as i32) as usize;
+
+            // 4×4 stratified sample grid inside each cell.
+            const N: usize = 4;
+            const INV_N: f32 = 1.0 / N as f32;
+
+            for gy in gy_min..gy_max {
+                for gx in gx_min..gx_max {
+                    let cell_x_lo = gx as f32 * cell_w;
+                    let cell_y_lo = gy as f32 * cell_h;
+                    let mut hits = 0u32;
+                    for sy in 0..N {
+                        let py = cell_y_lo + (sy as f32 + 0.5) * cell_h * INV_N;
+                        for sx in 0..N {
+                            let px = cell_x_lo + (sx as f32 + 0.5) * cell_w * INV_N;
+                            // Rotate sample point into OBB local frame.
+                            let dx = px - cx;
+                            let dy = py - cy;
+                            let lx = dx * cos_r + dy * sin_r;
+                            let ly = -dx * sin_r + dy * cos_r;
+                            if lx.abs() <= hx && ly.abs() <= hy {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    let fraction = hits as f32 / (N * N) as f32;
+                    if fraction > out[gy * w + gx].mask {
+                        let ob = out[gy * w + gx].open_boundary;
+                        out[gy * w + gx] = ObstacleTexel {
+                            mask: fraction,
+                            vel_x: patch.vel_x * vel_scale,
+                            vel_y: patch.vel_y * vel_scale,
+                            open_boundary: ob,
+                        };
+                    }
                 }
             }
         }
