@@ -178,6 +178,7 @@ struct AppState {
     // simulation
     sim: Simulation,
     paused: bool,
+    pending_step: bool,
     step_count: u64,
     tau_ui: f32, // τ as edited in egui (applied on change)
     intensity_ui: f32,
@@ -537,6 +538,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         egui_winit,
         sim,
         paused: false,
+        pending_step: false,
         step_count: 0,
         tau_ui: tau,
         intensity_ui: 1.0,
@@ -594,15 +596,20 @@ fn update_and_render(state: &mut AppState) {
         .sim
         .set_additive_injection(state.additive_injection_ui);
 
+    // ── Determine whether to advance the simulation this frame ───────────
+    let was_pending_step = state.pending_step;
+    let should_step = !state.paused || was_pending_step;
+    state.pending_step = false;
+
     // ── Advance oscillating block (narrow vertical bar near the bottom) ───
     // The block moves left-right sinusoidally.  Its world velocity is
     // converted to lattice units and stored in the obstacle texel so that
     // the boundary pass applies moving bounce-back momentum transfer.
-    if !state.paused {
+    if should_step {
         state.block_phase += state.block_speed_ui;
     }
     let block_cx = 5.0_f32 + 2.5 * state.block_phase.sin();
-    let block_vel_w = if state.paused {
+    let block_vel_w = if state.paused && !was_pending_step {
         0.0_f32
     } else {
         2.5 * state.block_speed_ui * state.block_phase.cos()
@@ -634,7 +641,7 @@ fn update_and_render(state: &mut AppState) {
     );
 
     // ── Continuous top-right injector ─────────────────────────────────────
-    if !state.paused && state.step_count % 4 == 0 {
+    if should_step && state.step_count % 4 == 0 {
         state.sim.push_event(InjectionEvent {
             x: 7.5,
             y: 1.5,
@@ -649,7 +656,7 @@ fn update_and_render(state: &mut AppState) {
     }
 
     // ── Advance simulation ────────────────────────────────────────────────
-    if !state.paused {
+    if should_step {
         state.sim.step(&state.device, &state.queue);
         state.step_count += 1;
     }
@@ -709,6 +716,7 @@ fn update_and_render(state: &mut AppState) {
     let max_speed_ref = state.max_speed;
     let sim_tau_ref = state.sim.config.tau;
     let mut do_reset = false;
+    let mut do_step = false;
 
     let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
         egui::Panel::right("controls")
@@ -740,6 +748,9 @@ fn update_and_render(state: &mut AppState) {
                     .clicked()
                 {
                     *paused_ref = !*paused_ref;
+                }
+                if ui.button("⏭ Step").clicked() {
+                    do_step = true;
                 }
                 if ui.button("⟳ Reset").clicked() {
                     do_reset = true;
@@ -776,6 +787,9 @@ fn update_and_render(state: &mut AppState) {
     });
 
     // Apply deferred actions.
+    if do_step {
+        state.pending_step = true;
+    }
     if do_reset {
         let cfg = state.sim.config.clone();
         state.sim = Simulation::new(&state.device, cfg);
