@@ -27,7 +27,7 @@ struct LbmUniforms {
     gravity_x: f32,
     gravity_y: f32,
     injection_mode: u32,
-    _pad0: u32,
+    inv_tau_minus: f32,
 }
 
 struct GpuEvent {

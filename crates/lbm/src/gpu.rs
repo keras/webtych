@@ -405,6 +405,12 @@ pub fn build_uniforms(
         dissipations[i / 4][i % 4] = p.dissipation;
     }
 
+    let tau_minus = config.tau_minus.unwrap_or_else(|| {
+        // Magic number: Λ = (τ⁺ − ½)(τ⁻ − ½) = 3/16
+        // Eliminates wall-location errors for straight no-slip boundaries.
+        0.5 + 3.0 / (16.0 * (config.tau - 0.5))
+    });
+
     LbmUniforms {
         grid_width: config.grid_width,
         grid_height: config.grid_height,
@@ -420,6 +426,6 @@ pub fn build_uniforms(
         gravity_x: config.gravity_x,
         gravity_y: config.gravity_y,
         injection_mode: if additive_injection { 1 } else { 0 },
-        _pad: 0,
+        inv_tau_minus: 1.0 / tau_minus,
     }
 }

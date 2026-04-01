@@ -169,5 +169,6 @@ pub struct LbmUniforms {
     /// Injection write mode.
     /// 0 = replacement (overwrite cell state), 1 = additive (delta onto existing state).
     pub injection_mode: u32,
-    pub _pad: u32,
+    /// 1/τ⁻ — antisymmetric relaxation rate, derived from the TRT magic number.
+    pub inv_tau_minus: f32,
 }

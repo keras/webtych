@@ -20,14 +20,24 @@ pub struct SimConfig {
     /// Height of the simulation grid in cells.
     pub grid_height: u32,
 
-    /// BGK relaxation time τ.  Controls kinematic viscosity:
-    ///   ν = (1/3) × (τ − 0.5)
+    /// TRT symmetric relaxation time τ⁺.  Controls kinematic viscosity:
+    ///   ν = (1/3) × (τ⁺ − 0.5)
     ///
     /// Must be > 0.5 for numerical stability.
     /// * 0.6  → low viscosity, turbulent swirling smoke.
     /// * 0.8  → moderate viscosity, smooth billowing.
     /// * 1.0+ → high viscosity, thick flow.
     pub tau: f32,
+
+    /// TRT antisymmetric relaxation time τ⁻.
+    ///
+    /// `None` (default) uses the magic number  Λ = (τ⁺ − ½)(τ⁻ − ½) = 3/16,
+    /// which eliminates wall-location errors for straight boundaries:
+    ///   τ⁻ = 0.5 + 3 / (16 × (τ⁺ − 0.5))
+    ///
+    /// Set explicitly only if you need independent control over the
+    /// antisymmetric relaxation (e.g. anisotropic diffusion tuning).
+    pub tau_minus: Option<f32>,
 
     /// Physical world width that the grid covers (in game-world units).
     /// Used to convert world-space obstacle positions to grid coordinates.
@@ -70,6 +80,7 @@ impl SimConfig {
             grid_width: 256,
             grid_height: 256,
             tau: 0.7,
+            tau_minus: None,
             world_width,
             world_height,
             color_count,

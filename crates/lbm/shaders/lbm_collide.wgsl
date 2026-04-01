@@ -1,10 +1,17 @@
 // lbm_collide.wgsl
 //
-// Pass 2: BGK (single-relaxation-time) collision.
+// Pass 2: TRT (Two-Relaxation-Time) collision.
 //
-// For each non-obstacle fluid cell, compute the equilibrium distribution
-// from the local macroscopic ρ and u, then relax toward it:
-//   f_i ← f_i − (1/τ) × (f_i − f_i_eq)
+// For each non-obstacle fluid cell, split f into symmetric (+) and
+// antisymmetric (−) parts relative to opposite-direction pairs, then
+// relax each independently:
+//
+//   f_i ← f_i − s⁺ × (f⁺_i − f⁺_i_eq) − s⁻ × (f⁻_i − f⁻_i_eq)
+//
+// where  f⁺_i = ½(f_i + f_ī),  f⁻_i = ½(f_i − f_ī)
+// and    s⁺ = 1/τ⁺  (controls kinematic viscosity)
+//        s⁻ = 1/τ⁻  (set via magic number Λ = (τ⁺−½)(τ⁻−½) = 3/16
+//                     to eliminate wall-location errors)
 //
 // The boundary pass will later overwrite solid cells, so we skip them here
 // to avoid wasted work (checking the obstacle texture is cheap but the
@@ -30,7 +37,7 @@ struct LbmUniforms {
     gravity_x: f32,
     gravity_y: f32,
     injection_mode: u32,
-    _pad0: u32,
+    inv_tau_minus: f32,
 }
 
 @group(0) @binding(0) var<uniform>            u:         LbmUniforms;
@@ -55,6 +62,9 @@ const W  = array<f32, 9>(
 );
 
 const CS2: f32 = 1.0 / 3.0;   // lattice speed-of-sound squared
+
+// Opposite-direction index: 0↔0, 1↔3, 2↔4, 5↔7, 6↔8
+const OPP = array<u32, 9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
 
 // ── Equilibrium ──────────────────────────────────────────────────────────────
 
@@ -114,9 +124,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ux_g = ux + u.gravity_x * u.tau;
     let uy_g = uy + u.gravity_y * u.tau;
 
-    // BGK relaxation: f_i ← f_i − inv_τ × (f_i − f_i_eq)
+    // TRT relaxation: relax symmetric and antisymmetric parts independently.
     for (var i: u32 = 0u; i < 9u; i++) {
-        f[i] = f[i] - u.inv_tau * (f[i] - f_eq(i, rho, ux_g, uy_g));
+        let j        = OPP[i];
+        let eq_i     = f_eq(i, rho, ux_g, uy_g);
+        let eq_j     = f_eq(j, rho, ux_g, uy_g);
+        let sym_neq  = 0.5 * ((f[i] + f[j]) - (eq_i + eq_j));
+        let asym_neq = 0.5 * ((f[i] - f[j]) - (eq_i - eq_j));
+        f[i] = f[i] - u.inv_tau * sym_neq - u.inv_tau_minus * asym_neq;
     }
 
     // Write back.

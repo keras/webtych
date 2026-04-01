@@ -382,6 +382,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         grid_width: GRID_W,
         grid_height: GRID_H,
         tau,
+        tau_minus: None,
         world_width: 10.0,
         world_height: 15.0, // portrait 2:3 world matching the 128×192 grid
         color_count: 1,
