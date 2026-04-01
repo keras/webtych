@@ -82,12 +82,12 @@ impl GpuGrid {
         let distributions_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("lbm::distributions_a"),
             contents: init_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         });
         let distributions_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("lbm::distributions_b"),
             contents: init_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         });
 
         // Macroscopic: [rho, ux, uy] per cell, initialised to rho=1, u=(0,0).

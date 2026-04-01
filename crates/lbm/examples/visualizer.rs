@@ -168,7 +168,8 @@ struct AppState {
     vis_bind_group: wgpu::BindGroup,
     vis_bind_layout: wgpu::BindGroupLayout,
 
-    staging_buf: wgpu::Buffer, // MAP_READ copy of macroscopic
+    staging_buf: wgpu::Buffer,      // MAP_READ copy of macroscopic
+    dist_staging_buf: wgpu::Buffer, // MAP_READ copy of distributions
 
     // egui
     egui_ctx: egui::Context,
@@ -191,6 +192,7 @@ struct AppState {
     additive_injection_ui: bool,
     substeps_ui: u32,
     macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
+    dist_data: Vec<f32>,        // last readback of 9 distribution values per cell
     max_speed: f32,             // maximum fluid speed observed in the last readback
 
     window: Arc<Window>,
@@ -413,6 +415,15 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         mapped_at_creation: false,
     });
 
+    // ── Staging buffer for distribution readback ──────────────────────────
+    let dist_size = sim.grid.src_distributions().size();
+    let dist_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vis-dist-staging"),
+        size: dist_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     // ── Visualisation pipeline ────────────────────────────────────────────
     let vis_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vis-shader"),
@@ -533,6 +544,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         vis_bind_group,
         vis_bind_layout,
         staging_buf,
+        dist_staging_buf,
         egui_ctx,
         egui_renderer,
         egui_winit,
@@ -551,6 +563,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         additive_injection_ui: true,
         substeps_ui: 1,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
+        dist_data: vec![0.0f32; (GRID_W * GRID_H * 9) as usize],
         max_speed: 0.0,
         window,
     }
@@ -777,6 +790,37 @@ fn update_and_render(state: &mut AppState) {
                     ui.label(format!("  ρ : {:.4}", rho));
                     ui.label(format!("  u_x : {:.4}", ux));
                     ui.label(format!("  u_y : {:.4}", uy));
+
+                    // D2Q9 distribution: 3×3 grid
+                    // directions: 0=(0,0) 1=(+1,0) 2=(0,+1) 3=(-1,0) 4=(0,-1)
+                    //             5=(+1,+1) 6=(-1,+1) 7=(-1,-1) 8=(+1,-1)
+                    // display layout (row 0=top):
+                    //   [6] [2] [5]   NW  N  NE
+                    //   [3] [0] [1]   W   C  E
+                    //   [7] [4] [8]   SW  S  SE
+                    ui.add_space(4.0);
+                    ui.label("D2Q9 fᵢ:");
+                    let base = cell_idx * 9;
+                    let f = |i: usize| -> f32 {
+                        let v = state.dist_data.get(base + i).copied().unwrap_or(0.0);
+                        (v * 10000.0).round() / 10000.0
+                    };
+                    let display_order: [[usize; 3]; 3] = [[6, 2, 5], [3, 0, 1], [7, 4, 8]];
+                    egui::Grid::new("d2q9_grid")
+                        .num_columns(3)
+                        .spacing([2.0, 2.0])
+                        .show(ui, |ui| {
+                            for row in &display_order {
+                                for &dir in row {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.4}", f(dir)))
+                                            .monospace()
+                                            .size(9.5),
+                                    );
+                                }
+                                ui.end_row();
+                            }
+                        });
                 } else {
                     ui.label("  (move cursor over field)");
                 }
@@ -910,14 +954,17 @@ fn update_and_render(state: &mut AppState) {
 fn do_readback(state: &mut AppState) {
     let macro_buf = state.sim.macroscopic_buffer();
     let buf_size = macro_buf.size();
+    let dist_buf = state.sim.grid.src_distributions();
+    let dist_size = dist_buf.size();
 
-    // Copy macroscopic → staging.
+    // Copy macroscopic + distributions → staging buffers.
     let mut enc = state
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("readback-enc"),
         });
     enc.copy_buffer_to_buffer(macro_buf, 0, &state.staging_buf, 0, buf_size);
+    enc.copy_buffer_to_buffer(dist_buf, 0, &state.dist_staging_buf, 0, dist_size);
     state.queue.submit(std::iter::once(enc.finish()));
 
     // Blocking poll (fast — Metal/Vulkan, no window stall).
@@ -962,6 +1009,25 @@ fn do_readback(state: &mut AppState) {
         state.nonambient = na;
         state.max_speed = max_speed;
         state.macroscopic_data = data;
+    }
+
+    // Read distribution buffer.
+    let (dtx, drx) = std::sync::mpsc::channel();
+    state
+        .dist_staging_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| {
+            let _ = dtx.send(r);
+        });
+    let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+
+    if drx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+        let data: Vec<f32> = {
+            let view = state.dist_staging_buf.slice(..).get_mapped_range();
+            bytemuck::cast_slice::<u8, f32>(&view).to_vec()
+        };
+        state.dist_staging_buf.unmap();
+        state.dist_data = data;
     }
 }
 
