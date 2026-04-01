@@ -405,17 +405,28 @@ pub fn build_uniforms(
         dissipations[i / 4][i % 4] = p.dissipation;
     }
 
-    let tau_minus = config.tau_minus.unwrap_or_else(|| {
-        // Magic number: Λ = (τ⁺ − ½)(τ⁻ − ½) = 3/16
-        // Eliminates wall-location errors for straight no-slip boundaries.
-        0.5 + 3.0 / (16.0 * (config.tau - 0.5))
+    // MRT relaxation rates (Lallemand & Luo 2000).
+    let s_nu = 1.0 / config.tau;                   // shear/normal stress → kinematic viscosity
+    let s_e  = config.mrt_s_e;                     // energy and ghost modes
+    let s_q  = config.mrt_s_q.unwrap_or_else(|| {
+        // Recommended: keeps viscosity well-defined across resolutions.
+        8.0 * (2.0 - s_nu) / (8.0 - s_nu)
     });
+
+    // Pack as 3 vec4s: [s0..s3], [s4..s7], [s8, 0, 0, 0]
+    // Conserved-moment slots (s0, s3, s5) are 0.0; their non-equilibrium is
+    // always zero so the value never contributes to the collision.
+    let mrt_s = [
+        [0.0_f32, s_e,   s_e,  0.0],   // s0(unused), s1(e), s2(ε), s3(unused)
+        [s_q,     0.0,   s_q,  s_nu],  // s4(qx), s5(unused), s6(qy), s7(Pxx)
+        [s_nu,    0.0,   0.0,  0.0],   // s8(Pxy), padding
+    ];
 
     LbmUniforms {
         grid_width: config.grid_width,
         grid_height: config.grid_height,
         tau: config.tau,
-        inv_tau: 1.0 / config.tau,
+        _pad0: 0.0,
         world_width: config.world_width,
         world_height: config.world_height,
         event_count,
@@ -426,6 +437,7 @@ pub fn build_uniforms(
         gravity_x: config.gravity_x,
         gravity_y: config.gravity_y,
         injection_mode: if additive_injection { 1 } else { 0 },
-        inv_tau_minus: 1.0 / tau_minus,
+        _pad1: 0,
+        mrt_s,
     }
 }

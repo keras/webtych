@@ -18,7 +18,7 @@ struct LbmUniforms {
     grid_width:  u32,
     grid_height: u32,
     tau:         f32,
-    inv_tau:     f32,
+    _pad0:       f32,
 
     world_width:  f32,
     world_height: f32,
@@ -32,7 +32,9 @@ struct LbmUniforms {
     gravity_x: f32,
     gravity_y: f32,
     injection_mode: u32,
-    inv_tau_minus: f32,
+    _pad1: u32,
+
+    mrt_s: array<vec4<f32>, 3>,
 }
 
 @group(0) @binding(0) var<uniform>            u:         LbmUniforms;

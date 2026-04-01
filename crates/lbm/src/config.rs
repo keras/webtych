@@ -20,8 +20,8 @@ pub struct SimConfig {
     /// Height of the simulation grid in cells.
     pub grid_height: u32,
 
-    /// TRT symmetric relaxation time τ⁺.  Controls kinematic viscosity:
-    ///   ν = (1/3) × (τ⁺ − 0.5)
+    /// MRT shear relaxation time τ (= 1/s_ν).  Controls kinematic viscosity:
+    ///   ν = (1/3) × (τ − 0.5)
     ///
     /// Must be > 0.5 for numerical stability.
     /// * 0.6  → low viscosity, turbulent swirling smoke.
@@ -29,15 +29,19 @@ pub struct SimConfig {
     /// * 1.0+ → high viscosity, thick flow.
     pub tau: f32,
 
-    /// TRT antisymmetric relaxation time τ⁻.
+    /// MRT energy relaxation rate s_e (= s_ε).
     ///
-    /// `None` (default) uses the magic number  Λ = (τ⁺ − ½)(τ⁻ − ½) = 3/16,
-    /// which eliminates wall-location errors for straight boundaries:
-    ///   τ⁻ = 0.5 + 3 / (16 × (τ⁺ − 0.5))
+    /// Controls how fast the energy and ghost-energy moments relax.
+    /// Must be in (0, 2) for stability.  Default 1.0 is a safe choice;
+    /// values closer to 2.0 damp energy modes more aggressively.
+    pub mrt_s_e: f32,
+
+    /// MRT energy-flux relaxation rate s_q.
     ///
-    /// Set explicitly only if you need independent control over the
-    /// antisymmetric relaxation (e.g. anisotropic diffusion tuning).
-    pub tau_minus: Option<f32>,
+    /// `None` (default) uses the Lallemand & Luo recommended formula:
+    ///   s_q = 8 × (2 − s_ν) / (8 − s_ν)
+    /// which keeps the effective viscosity well-defined at all resolutions.
+    pub mrt_s_q: Option<f32>,
 
     /// Physical world width that the grid covers (in game-world units).
     /// Used to convert world-space obstacle positions to grid coordinates.
@@ -80,7 +84,8 @@ impl SimConfig {
             grid_width: 256,
             grid_height: 256,
             tau: 0.7,
-            tau_minus: None,
+            mrt_s_e: 1.0,
+            mrt_s_q: None,
             world_width,
             world_height,
             color_count,

@@ -146,8 +146,9 @@ impl From<&InjectionEvent> for GpuEvent {
 pub struct LbmUniforms {
     pub grid_width: u32,
     pub grid_height: u32,
+    /// τ = 1/s_ν.  Kept in uniforms for the gravity body-force shift (u_eff = u + g·τ).
     pub tau: f32,
-    pub inv_tau: f32,
+    pub _pad0: f32,
 
     pub world_width: f32,
     pub world_height: f32,
@@ -169,6 +170,11 @@ pub struct LbmUniforms {
     /// Injection write mode.
     /// 0 = replacement (overwrite cell state), 1 = additive (delta onto existing state).
     pub injection_mode: u32,
-    /// 1/τ⁻ — antisymmetric relaxation rate, derived from the TRT magic number.
-    pub inv_tau_minus: f32,
+    pub _pad1: u32,
+
+    /// MRT relaxation rates packed as 3×vec4 (12 slots, 9 used).
+    /// Layout: [s0..s3], [s4..s7], [s8, 0, 0, 0]
+    /// s0/s3/s5 are conserved-moment placeholders (zero non-equilibrium, value unused).
+    /// s1=s_e, s2=s_ε, s4=s6=s_q, s7=s8=s_ν=1/τ.
+    pub mrt_s: [[f32; 4]; 3],
 }
