@@ -85,6 +85,11 @@ pub struct SimConfig {
 
     /// Which collision operator to use.
     pub collision_mode: CollisionMode,
+
+    /// When true, solid cells are relaxed to equilibrium at the obstacle velocity
+    /// each collision step, pushing fluid in the direction the solid is moving.
+    /// When false (default), solid cells are skipped in the collision pass.
+    pub solid_push_fluid: bool,
 }
 
 impl SimConfig {
@@ -112,6 +117,7 @@ impl SimConfig {
             gravity_x: 0.0,
             gravity_y: 0.0,
             collision_mode: CollisionMode::Mrt,
+            solid_push_fluid: false,
         }
     }
 

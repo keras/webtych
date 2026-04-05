@@ -189,7 +189,8 @@ pub struct LbmUniforms {
     /// Injection write mode.
     /// 0 = replacement (overwrite cell state), 1 = additive (delta onto existing state).
     pub injection_mode: u32,
-    pub _pad1: u32,
+    /// 1 = force solid cells to equilibrium at obstacle velocity; 0 = skip (default).
+    pub solid_push_fluid: u32,
 
     /// MRT relaxation rates packed as 3×vec4 (12 slots, 9 used).
     /// Layout: [s0..s3], [s4..s7], [s8, 0, 0, 0]

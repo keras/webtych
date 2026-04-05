@@ -32,7 +32,7 @@ struct LbmUniforms {
     gravity_x: f32,
     gravity_y: f32,
     injection_mode: u32,
-    _pad1: u32,
+    solid_push_fluid: u32,
 
     mrt_s: array<vec4<f32>, 3>,  // unused by TRT
 }
@@ -74,6 +74,27 @@ fn cell_index(gx: u32, gy: u32) -> u32 { return gy * u.grid_width + gx; }
 fn dist_idx(cell: u32, i: u32) -> u32 { return cell * 9u + i; }
 fn macro_idx(cell: u32) -> u32         { return cell * 3u; }
 
+fn push_fluid_toward(d0: u32, rho: f32, vel_x: f32, vel_y: f32) {
+    let vel  = vec2<f32>(vel_x, vel_y);
+    let vlen = length(vel);
+    let dir  = select(vec2<f32>(0.0, 0.0), vel / vlen, vlen > 1e-6);
+    var w: array<f32, 9>;
+    var wsum = 0.0;
+    for (var i: u32 = 0u; i < 9u; i++) {
+        let proj = EX[i] * dir.x + EY[i] * dir.y;
+        w[i] = max(0.0, proj);
+        wsum += w[i];
+    }
+    if wsum > 1e-6 {
+        for (var i: u32 = 0u; i < 9u; i++) {
+            dist_src[d0 + i] = rho * w[i] / wsum;
+        }
+    } else {
+        dist_src[d0] = rho;
+        for (var i: u32 = 1u; i < 9u; i++) { dist_src[d0 + i] = 0.0; }
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 @compute @workgroup_size(8, 8, 1)
@@ -81,9 +102,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gx = gid.x;
     let gy = gid.y;
     if gx >= u.grid_width || gy >= u.grid_height { return; }
-
-    let obs = textureLoad(obstacle, vec2<i32>(i32(gx), i32(gy)), 0);
-    if obs.r > 0.999 { return; }
 
     let cell = cell_index(gx, gy);
     let d0 = dist_idx(cell, 0u);
@@ -102,6 +120,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if rho < 1e-6 { rho = 1e-6; }
     ux /= rho;
     uy /= rho;
+
+    let obs = textureLoad(obstacle, vec2<i32>(i32(gx), i32(gy)), 0);
+    if obs.r > 0.999 {
+        if u.solid_push_fluid != 0u {
+            push_fluid_toward(d0, rho, obs.g, obs.b);
+        }
+        return;
+    }
 
     let max_u = 0.25;
     ux = clamp(ux, -max_u, max_u);

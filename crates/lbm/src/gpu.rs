@@ -518,7 +518,7 @@ pub fn build_uniforms(
         gravity_x: config.gravity_x,
         gravity_y: config.gravity_y,
         injection_mode: if additive_injection { 1 } else { 0 },
-        _pad1: 0,
+        solid_push_fluid: if config.solid_push_fluid { 1 } else { 0 },
         mrt_s,
     }
 }

@@ -119,9 +119,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gy = gid.y;
     if gx >= u.grid_width || gy >= u.grid_height { return; }
 
-    // Skip obstacle cells — colour density doesn't exist inside solids.
+    // Solid cells hold no colour density; clear any stale value left behind
+    // when the obstacle moved over a previously-fluid cell, then skip advection.
     let obs = textureLoad(obstacle, vec2<i32>(i32(gx), i32(gy)), 0);
-    if obs.r > 0.5 { return; }
+    if obs.r > 0.5 {
+        let cell = cell_idx(gx, gy);
+        for (var c: u32 = 0u; c < u.color_count; c++) {
+            write_color(c, cell, 0.0);
+        }
+        return;
+    }
 
     let cell = cell_idx(gx, gy);
     let m0   = macro_idx(cell);

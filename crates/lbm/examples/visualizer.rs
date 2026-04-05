@@ -190,6 +190,7 @@ struct AppState {
     block_speed_ui: f32,           // phase increment per step
     gravity_ui: f32,               // gravity_y fed to sim config
     additive_injection_ui: bool,
+    solid_push_fluid_ui: bool,
     substeps_ui: u32,
     collision_mode_ui: CollisionMode,
     macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
@@ -393,6 +394,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         gravity_x: 0.0,
         gravity_y: 0.0003, // default: gentle downward pull
         collision_mode,
+        solid_push_fluid: false,
         effect_profiles: vec![EffectProfile {
             inject_density: 0.5, // mild injection — avoids Mach-limit overshoot
             inject_color_density: 0.3,
@@ -566,6 +568,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         block_speed_ui: 0.005,
         gravity_ui: 0.0003,
         additive_injection_ui: true,
+        solid_push_fluid_ui: false,
         substeps_ui: 1,
         collision_mode_ui: collision_mode,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
@@ -612,6 +615,7 @@ fn update_and_render(state: &mut AppState) {
     state.sim.config.gravity_y = state.gravity_ui;
     state.sim.config.substeps = state.substeps_ui;
     state.sim.config.collision_mode = state.collision_mode_ui;
+    state.sim.config.solid_push_fluid = state.solid_push_fluid_ui;
     state
         .sim
         .set_additive_injection(state.additive_injection_ui);
@@ -733,6 +737,7 @@ fn update_and_render(state: &mut AppState) {
     let gravity_ref = &mut state.gravity_ui;
     let block_speed_ref = &mut state.block_speed_ui;
     let additive_injection_ref = &mut state.additive_injection_ui;
+    let solid_push_fluid_ref = &mut state.solid_push_fluid_ui;
     let substeps_ref = &mut state.substeps_ui;
     let collision_mode_ref = &mut state.collision_mode_ui;
     let step_count_ref = state.step_count;
@@ -779,6 +784,7 @@ fn update_and_render(state: &mut AppState) {
                     });
 
                 ui.checkbox(additive_injection_ref, "Additive injection");
+                ui.checkbox(solid_push_fluid_ref, "Push fluid from solids");
 
                 ui.separator();
                 if ui
