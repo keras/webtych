@@ -619,14 +619,17 @@ impl Renderer {
         });
 
         // ── LBM simulation ──────────────────────────────────────────────
-        const LBM_SUBSTEPS: u32 = 4;
+        const LBM_SUBSTEPS: u32 = 16;
 
         let color_count = palette.len();
-        let mut sim_config = SimConfig::for_game_board(10.0, 20.0, color_count);
+        let mut sim_config: SimConfig = SimConfig::for_game_board(10.0, 20.0, color_count);
         sim_config.substeps = LBM_SUBSTEPS;
-        sim_config.grid_height = 192 * 4;
-        sim_config.grid_width = 128 * 4;
+        sim_config.grid_height = 192 * 2;
+        sim_config.grid_width = 128 * 2;
         sim_config.tau = 0.8;
+        for profile in &mut sim_config.effect_profiles {
+            profile.dissipation = 0.9999; // closer to 1.0 = slower fade
+        }
         let grid_width = sim_config.grid_width;
         let grid_height = sim_config.grid_height;
         let mut simulation = Simulation::new(&device, sim_config);

@@ -242,6 +242,7 @@ impl Simulation {
                 &bind_group,
                 self.config.grid_width,
                 self.config.grid_height,
+                self.config.collision_mode,
             );
 
             queue.submit(std::iter::once(encoder.finish()));

@@ -23,7 +23,7 @@ use winit::{
 };
 
 use webtych_lbm::{
-    config::{EffectProfile, SimConfig},
+    config::{CollisionMode, EffectProfile, SimConfig},
     types::{EventKind, InjectionEvent, ObstaclePatch, OpenBoundaryPatch},
     Simulation,
 };
@@ -191,6 +191,7 @@ struct AppState {
     gravity_ui: f32,               // gravity_y fed to sim config
     additive_injection_ui: bool,
     substeps_ui: u32,
+    collision_mode_ui: CollisionMode,
     macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
     dist_data: Vec<f32>,        // last readback of 9 distribution values per cell
     max_speed: f32,             // maximum fluid speed observed in the last readback
@@ -378,6 +379,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
 
     // ── Simulation ────────────────────────────────────────────────────────
     let tau = 0.7_f32;
+    let collision_mode = CollisionMode::Mrt;
     let config = SimConfig {
         grid_width: GRID_W,
         grid_height: GRID_H,
@@ -390,6 +392,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         substeps: 1,
         gravity_x: 0.0,
         gravity_y: 0.0003, // default: gentle downward pull
+        collision_mode,
         effect_profiles: vec![EffectProfile {
             inject_density: 0.5, // mild injection — avoids Mach-limit overshoot
             inject_color_density: 0.3,
@@ -564,6 +567,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         gravity_ui: 0.0003,
         additive_injection_ui: true,
         substeps_ui: 1,
+        collision_mode_ui: collision_mode,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
         dist_data: vec![0.0f32; (GRID_W * GRID_H * 9) as usize],
         max_speed: 0.0,
@@ -607,6 +611,7 @@ fn update_and_render(state: &mut AppState) {
     }
     state.sim.config.gravity_y = state.gravity_ui;
     state.sim.config.substeps = state.substeps_ui;
+    state.sim.config.collision_mode = state.collision_mode_ui;
     state
         .sim
         .set_additive_injection(state.additive_injection_ui);
@@ -729,6 +734,7 @@ fn update_and_render(state: &mut AppState) {
     let block_speed_ref = &mut state.block_speed_ui;
     let additive_injection_ref = &mut state.additive_injection_ui;
     let substeps_ref = &mut state.substeps_ui;
+    let collision_mode_ref = &mut state.collision_mode_ui;
     let step_count_ref = state.step_count;
     let peak_rho_ref = state.peak_rho;
     let nonambient_ref = state.nonambient;
@@ -758,6 +764,19 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.label("Substeps");
                 ui.add(egui::Slider::new(substeps_ref, 1..=8).step_by(1.0));
+
+                ui.label("Collision operator");
+                egui::ComboBox::from_id_salt("collision_mode")
+                    .selected_text(match *collision_mode_ref {
+                        CollisionMode::Bgk => "BGK",
+                        CollisionMode::Trt => "TRT",
+                        CollisionMode::Mrt => "MRT",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(collision_mode_ref, CollisionMode::Bgk, "BGK");
+                        ui.selectable_value(collision_mode_ref, CollisionMode::Trt, "TRT");
+                        ui.selectable_value(collision_mode_ref, CollisionMode::Mrt, "MRT");
+                    });
 
                 ui.checkbox(additive_injection_ref, "Additive injection");
 

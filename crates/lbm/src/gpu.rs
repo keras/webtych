@@ -10,7 +10,7 @@
 //! 5. **extract** — compute macroscopic ρ and u from distributions.
 //! 6. **advect**  — semi-Lagrangian advection of colour-density fields.
 
-use crate::config::SimConfig;
+use crate::config::{CollisionMode, SimConfig};
 use crate::grid::GpuGrid;
 use crate::types::{LbmUniforms, ObstacleTexel};
 
@@ -26,7 +26,9 @@ macro_rules! shader {
 /// All compute pipelines for one simulation instance.
 pub struct GpuPipelines {
     pub inject: wgpu::ComputePipeline,
-    pub collide: wgpu::ComputePipeline,
+    pub collide_bgk: wgpu::ComputePipeline,
+    pub collide_trt: wgpu::ComputePipeline,
+    pub collide_mrt: wgpu::ComputePipeline,
     pub stream: wgpu::ComputePipeline,
     pub boundary: wgpu::ComputePipeline,
     pub extract: wgpu::ComputePipeline,
@@ -161,7 +163,9 @@ impl GpuPipelines {
 
         // ── Shader modules ───────────────────────────────────────────────────
         let inject_src = shader!("lbm_inject.wgsl");
-        let collide_src = shader!("lbm_collide.wgsl");
+        let collide_bgk_src = shader!("lbm_collide_bgk.wgsl");
+        let collide_trt_src = shader!("lbm_collide_trt.wgsl");
+        let collide_mrt_src = shader!("lbm_collide_mrt.wgsl");
         let stream_src = shader!("lbm_stream.wgsl");
         let boundary_src = shader!("lbm_boundary.wgsl");
         let extract_src = shader!("lbm_extract.wgsl");
@@ -175,7 +179,9 @@ impl GpuPipelines {
         };
 
         let sm_inject = make_shader("lbm_inject", inject_src);
-        let sm_collide = make_shader("lbm_collide", collide_src);
+        let sm_collide_bgk = make_shader("lbm_collide_bgk", collide_bgk_src);
+        let sm_collide_trt = make_shader("lbm_collide_trt", collide_trt_src);
+        let sm_collide_mrt = make_shader("lbm_collide_mrt", collide_mrt_src);
         let sm_stream = make_shader("lbm_stream", stream_src);
         let sm_boundary = make_shader("lbm_boundary", boundary_src);
         let sm_extract = make_shader("lbm_extract", extract_src);
@@ -193,7 +199,9 @@ impl GpuPipelines {
         };
 
         let inject = make_pipeline("lbm::inject", &sm_inject);
-        let collide = make_pipeline("lbm::collide", &sm_collide);
+        let collide_bgk = make_pipeline("lbm::collide_bgk", &sm_collide_bgk);
+        let collide_trt = make_pipeline("lbm::collide_trt", &sm_collide_trt);
+        let collide_mrt = make_pipeline("lbm::collide_mrt", &sm_collide_mrt);
         let stream = make_pipeline("lbm::stream", &sm_stream);
         let boundary = make_pipeline("lbm::boundary", &sm_boundary);
         let extract = make_pipeline("lbm::extract", &sm_extract);
@@ -210,7 +218,9 @@ impl GpuPipelines {
 
         Self {
             inject,
-            collide,
+            collide_bgk,
+            collide_trt,
+            collide_mrt,
             stream,
             boundary,
             extract,
@@ -290,6 +300,7 @@ pub fn encode_lbm_passes(
     bind_group: &wgpu::BindGroup,
     grid_width: u32,
     grid_height: u32,
+    collision_mode: CollisionMode,
 ) {
     let wg_x = grid_width.div_ceil(WG_SIZE);
     let wg_y = grid_height.div_ceil(WG_SIZE);
@@ -304,8 +315,14 @@ pub fn encode_lbm_passes(
         pass.dispatch_workgroups(wg_x, wg_y, 1);
     };
 
+    let collide_pipeline = match collision_mode {
+        CollisionMode::Bgk => &pipelines.collide_bgk,
+        CollisionMode::Trt => &pipelines.collide_trt,
+        CollisionMode::Mrt => &pipelines.collide_mrt,
+    };
+
     dispatch("lbm::inject", &pipelines.inject);
-    dispatch("lbm::collide", &pipelines.collide);
+    dispatch("lbm::collide", collide_pipeline);
     dispatch("lbm::stream", &pipelines.stream);
     dispatch("lbm::boundary", &pipelines.boundary);
     dispatch("lbm::extract", &pipelines.extract);

@@ -8,6 +8,21 @@ pub const MAX_COLORS: usize = 8;
 /// Maximum number of injection events per frame.
 pub const MAX_EVENTS: usize = 256;
 
+/// LBM collision operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionMode {
+    /// Single-relaxation-time (Bhatnagar-Gross-Krook).
+    /// Simple, fast, but viscosity-dependent wall placement.
+    Bgk,
+    /// Two-relaxation-time.  Separates symmetric (viscosity) and
+    /// antisymmetric (magic parameter Λ = 3/16) relaxation.  Eliminates
+    /// viscosity-dependent wall errors at minimal extra cost.
+    Trt,
+    /// Multiple-relaxation-time (Lallemand & Luo 2000).
+    /// Separate rates for energy, flux, and stress moments — most stable.
+    Mrt,
+}
+
 /// Configuration for the LBM simulation.
 ///
 /// Create once and pass to [`Simulation::new`](crate::Simulation::new).
@@ -67,6 +82,9 @@ pub struct SimConfig {
     /// Positive values pull toward +X / +Y (right / bottom of screen).
     pub gravity_x: f32,
     pub gravity_y: f32,
+
+    /// Which collision operator to use.
+    pub collision_mode: CollisionMode,
 }
 
 impl SimConfig {
@@ -93,6 +111,7 @@ impl SimConfig {
             substeps: 1,
             gravity_x: 0.0,
             gravity_y: 0.0,
+            collision_mode: CollisionMode::Mrt,
         }
     }
 
@@ -135,7 +154,7 @@ impl Default for EffectProfile {
     fn default() -> Self {
         Self {
             inject_density: 3.0,
-            inject_color_density: 1.0,
+            inject_color_density: 0.1,
             dissipation: 0.995,
         }
     }

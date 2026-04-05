@@ -52,6 +52,6 @@ pub mod grid;
 pub mod simulation;
 pub mod types;
 
-pub use config::{EffectProfile, SimConfig};
+pub use config::{CollisionMode, EffectProfile, SimConfig};
 pub use simulation::Simulation;
 pub use types::{EventKind, InjectionEvent, ObstaclePatch, OpenBoundaryPatch};
