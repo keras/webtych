@@ -55,8 +55,8 @@ struct Vis {
     win_w:    u32,   // surface width  in physical pixels
     win_h:    u32,   // surface height in physical pixels
     peak_rho: f32,
-    _pad0:    u32,
-    _pad1:    u32,
+    viz_mode: u32,   // 0 = Oklch, 1 = density greyscale
+    min_rho:  f32,
     _pad2:    u32,
 }
 @group(0) @binding(0) var<uniform> vis: Vis;
@@ -125,9 +125,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let ux  = macro_buf[cell * 3u + 1u];
     let uy  = macro_buf[cell * 3u + 2u];
 
+    if vis.viz_mode == 1u {
+        // Density-only: greyscale normalised against tracked min/max.
+        let hi = max(vis.peak_rho, 1.001);
+        let lo = min(vis.min_rho, 0.999);
+        let t  = clamp((rho - lo) / (hi - lo), 0.0, 1.0);
+        let g  = linear_to_srgb(t);
+        return vec4<f32>(g, g, g, 1.0);
+    }
+
     // Lightness: density mapped to [0.25, 0.90].
     let hi = max(vis.peak_rho, 1.001);
-    let t = clamp((rho - 0.95) / (hi - 0.95), 0.0, 1.0);
+    let lo = min(vis.min_rho, 0.999);
+    let t = clamp((rho - lo) / (hi - lo), 0.0, 1.0);
     let L = 0 + 0.65 * t;
 
     // Chroma: speed, saturates around 0.04 LBM units.
@@ -168,8 +178,9 @@ struct AppState {
     vis_bind_group: wgpu::BindGroup,
     vis_bind_layout: wgpu::BindGroupLayout,
 
-    staging_buf: wgpu::Buffer,      // MAP_READ copy of macroscopic
-    dist_staging_buf: wgpu::Buffer, // MAP_READ copy of distributions
+    staging_buf: wgpu::Buffer,          // MAP_READ copy of macroscopic
+    dist_staging_buf: wgpu::Buffer,     // MAP_READ copy of distributions
+    obstacle_staging_buf: wgpu::Buffer, // MAP_READ copy of obstacle texture
 
     // egui
     egui_ctx: egui::Context,
@@ -193,9 +204,12 @@ struct AppState {
     solid_push_fluid_ui: bool,
     substeps_ui: u32,
     collision_mode_ui: CollisionMode,
-    macroscopic_data: Vec<f32>, // last readback of [rho, ux, uy] per cell
-    dist_data: Vec<f32>,        // last readback of 9 distribution values per cell
+    macroscopic_data: Vec<f32>,   // last readback of [rho, ux, uy] per cell
+    dist_data: Vec<f32>,          // last readback of 9 distribution values per cell
+    obstacle_data: Vec<[f32; 4]>, // last readback of obstacle texture [mask, vel_x, vel_y, open_boundary]
     max_speed: f32,             // maximum fluid speed observed in the last readback
+    min_rho: f32,               // running minimum density (slow-tracking)
+    viz_mode_ui: u32,           // 0 = Oklch, 1 = density greyscale
 
     window: Arc<Window>,
 }
@@ -210,8 +224,8 @@ struct VisUniforms {
     win_w: u32,
     win_h: u32,
     peak_rho: f32,
-    _pad0: u32,
-    _pad1: u32,
+    viz_mode: u32,
+    min_rho: f32,
     _pad2: u32,
 }
 
@@ -431,6 +445,15 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         mapped_at_creation: false,
     });
 
+    // ── Staging buffer for obstacle texture readback ──────────────────────
+    // Rgba32Float = 4×f32 = 16 bytes per cell.
+    let obstacle_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vis-obstacle-staging"),
+        size: (GRID_W * GRID_H * 16) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     // ── Visualisation pipeline ────────────────────────────────────────────
     let vis_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vis-shader"),
@@ -445,8 +468,8 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
             win_w: phys.width,
             win_h: phys.height,
             peak_rho: 1.05,
-            _pad0: 0,
-            _pad1: 0,
+            viz_mode: 0,
+            min_rho: 1.0,
             _pad2: 0,
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -552,6 +575,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         vis_bind_layout,
         staging_buf,
         dist_staging_buf,
+        obstacle_staging_buf,
         egui_ctx,
         egui_renderer,
         egui_winit,
@@ -573,7 +597,10 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         collision_mode_ui: collision_mode,
         macroscopic_data: vec![1.0f32; (GRID_W * GRID_H * 3) as usize],
         dist_data: vec![0.0f32; (GRID_W * GRID_H * 9) as usize],
+        obstacle_data: vec![[0.0; 4]; (GRID_W * GRID_H) as usize],
         max_speed: 0.0,
+        min_rho: 1.0,
+        viz_mode_ui: 0,
         window,
     }
 }
@@ -633,11 +660,10 @@ fn update_and_render(state: &mut AppState) {
         state.block_phase += state.block_speed_ui;
     }
     let block_cx = 5.0_f32 + 2.5 * state.block_phase.sin();
-    let block_vel_w = if state.paused && !was_pending_step {
-        0.0_f32
-    } else {
-        2.5 * state.block_speed_ui * state.block_phase.cos()
-    };
+    // Always compute the instantaneous velocity for display in the side panel.
+    // The boundary pass doesn't run while paused, so storing the real velocity
+    // in the texture is harmless and keeps the cursor readout correct.
+    let block_vel_w = 2.5 * state.block_speed_ui * state.block_phase.cos();
     // world-units/step → lattice-units/step
     let block_vel_l = block_vel_w * GRID_W as f32 / 10.0;
     state.sim.set_obstacles(
@@ -691,7 +717,7 @@ fn update_and_render(state: &mut AppState) {
 
     // ── Non-blocking readback for stats (every 10 steps or so) ───────────
     if state.step_count % 10 == 1 || state.paused {
-        do_readback(state);
+        do_readback(state, should_step);
     }
 
     // ── Update vis uniform (window size may have changed on resize) ─────────
@@ -706,9 +732,9 @@ fn update_and_render(state: &mut AppState) {
             grid_h: GRID_H,
             win_w: field_w,
             win_h: phys.height.max(1),
-            peak_rho: (state.peak_rho * 1.1).max(1.01),
-            _pad0: 0,
-            _pad1: 0,
+            peak_rho: state.peak_rho.max(1.001),
+            viz_mode: state.viz_mode_ui,
+            min_rho: state.min_rho.min(0.999),
             _pad2: 0,
         }),
     );
@@ -740,6 +766,7 @@ fn update_and_render(state: &mut AppState) {
     let solid_push_fluid_ref = &mut state.solid_push_fluid_ui;
     let substeps_ref = &mut state.substeps_ui;
     let collision_mode_ref = &mut state.collision_mode_ui;
+    let viz_mode_ref = &mut state.viz_mode_ui;
     let step_count_ref = state.step_count;
     let peak_rho_ref = state.peak_rho;
     let nonambient_ref = state.nonambient;
@@ -753,6 +780,18 @@ fn update_and_render(state: &mut AppState) {
             .exact_size(200.0)
             .show_inside(ui, |ui| {
                 ui.heading("LBM Visualizer");
+                ui.separator();
+
+                ui.label("Color scheme");
+                egui::ComboBox::from_id_salt("viz_mode")
+                    .selected_text(match *viz_mode_ref {
+                        1 => "Density",
+                        _ => "Oklch",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(viz_mode_ref, 0, "Oklch");
+                        ui.selectable_value(viz_mode_ref, 1, "Density");
+                    });
                 ui.separator();
 
                 ui.label("Relaxation τ");
@@ -802,7 +841,10 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.separator();
                 ui.label(format!("Step : {step_count_ref}"));
-                ui.label(format!("Peak ρ : {peak_rho_ref:.4}"));
+                ui.label(format!(
+                    "ρ range : [{:.4}, {:.4}]",
+                    state.min_rho, peak_rho_ref
+                ));
                 ui.label(format!("Max speed : {max_speed_ref:.5}"));
                 ui.label(format!("Non-ambient cells : {nonambient_ref}"));
                 ui.label(format!("Grid : {}×{}", GRID_W, GRID_H));
@@ -817,7 +859,13 @@ fn update_and_render(state: &mut AppState) {
                     let rho = state.macroscopic_data[cell_idx * 3];
                     let ux = state.macroscopic_data[cell_idx * 3 + 1];
                     let uy = state.macroscopic_data[cell_idx * 3 + 2];
+                    let obs = state.obstacle_data.get(cell_idx).copied().unwrap_or([0.0; 4]);
+                    let is_solid = obs[0] > 0.5;
                     ui.label(format!("  ({}, {})", gx, gy));
+                    ui.label(format!("  solid : {}", if is_solid { "yes" } else { "no" }));
+                    if is_solid {
+                        ui.label(format!("  obs vel : ({:.4}, {:.4})", obs[1], obs[2]));
+                    }
                     ui.label(format!("  ρ : {:.4}", rho));
                     ui.label(format!("  u_x : {:.4}", ux));
                     ui.label(format!("  u_y : {:.4}", uy));
@@ -982,13 +1030,13 @@ fn update_and_render(state: &mut AppState) {
 
 // ── Non-blocking GPU → CPU readback for stats ────────────────────────────────
 
-fn do_readback(state: &mut AppState) {
+fn do_readback(state: &mut AppState, sim_stepped: bool) {
     let macro_buf = state.sim.macroscopic_buffer();
     let buf_size = macro_buf.size();
     let dist_buf = state.sim.grid.src_distributions();
     let dist_size = dist_buf.size();
 
-    // Copy macroscopic + distributions → staging buffers.
+    // Copy macroscopic + distributions + obstacle texture → staging buffers.
     let mut enc = state
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -996,6 +1044,18 @@ fn do_readback(state: &mut AppState) {
         });
     enc.copy_buffer_to_buffer(macro_buf, 0, &state.staging_buf, 0, buf_size);
     enc.copy_buffer_to_buffer(dist_buf, 0, &state.dist_staging_buf, 0, dist_size);
+    enc.copy_texture_to_buffer(
+        state.sim.grid.obstacle_texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &state.obstacle_staging_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(GRID_W * 16), // Rgba32Float = 16 bytes/texel
+                rows_per_image: Some(GRID_H),
+            },
+        },
+        wgpu::Extent3d { width: GRID_W, height: GRID_H, depth_or_array_layers: 1 },
+    );
     state.queue.submit(std::iter::once(enc.finish()));
 
     // Blocking poll (fast — Metal/Vulkan, no window stall).
@@ -1018,15 +1078,19 @@ fn do_readback(state: &mut AppState) {
         state.staging_buf.unmap();
 
         let n = (GRID_W * GRID_H) as usize;
-        let mut peak = 0.0_f32;
+        let mut obs_max = 0.0_f32;
+        let mut obs_min = f32::MAX;
         let mut na = 0u32;
         let mut max_speed = 0.0_f32;
         for cell in 0..n {
             let rho = data[cell * 3];
             let ux = data[cell * 3 + 1];
             let uy = data[cell * 3 + 2];
-            if rho > peak {
-                peak = rho;
+            if rho > obs_max {
+                obs_max = rho;
+            }
+            if rho < obs_min {
+                obs_min = rho;
             }
             if (rho - 1.0).abs() > 0.01 {
                 na += 1;
@@ -1036,7 +1100,20 @@ fn do_readback(state: &mut AppState) {
                 max_speed = speed;
             }
         }
-        state.peak_rho = peak;
+        // Always expand immediately to new extremes.
+        // Only decay back toward ambient when the simulation is actually running.
+        if obs_max > state.peak_rho {
+            state.peak_rho = obs_max;
+        } else if sim_stepped {
+            const DECAY: f32 = 0.02;
+            state.peak_rho += DECAY * (obs_max - state.peak_rho);
+        }
+        if obs_min < state.min_rho {
+            state.min_rho = obs_min;
+        } else if sim_stepped {
+            const DECAY: f32 = 0.02;
+            state.min_rho += DECAY * (obs_min - state.min_rho);
+        }
         state.nonambient = na;
         state.max_speed = max_speed;
         state.macroscopic_data = data;
@@ -1059,6 +1136,25 @@ fn do_readback(state: &mut AppState) {
         };
         state.dist_staging_buf.unmap();
         state.dist_data = data;
+    }
+
+    // Read obstacle texture.
+    let (otx, orx) = std::sync::mpsc::channel();
+    state
+        .obstacle_staging_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| {
+            let _ = otx.send(r);
+        });
+    let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+
+    if orx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+        let data: Vec<[f32; 4]> = {
+            let view = state.obstacle_staging_buf.slice(..).get_mapped_range();
+            bytemuck::cast_slice::<u8, [f32; 4]>(&view).to_vec()
+        };
+        state.obstacle_staging_buf.unmap();
+        state.obstacle_data = data;
     }
 }
 
