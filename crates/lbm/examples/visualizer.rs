@@ -126,12 +126,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let uy  = macro_buf[cell * 3u + 2u];
 
     if vis.viz_mode == 1u {
-        // Density-only: greyscale normalised against tracked min/max.
+        // Density mapped to an inferno-style color ramp.
+        // Polynomial fit to the inferno colormap (Viridis project, public domain).
         let hi = max(vis.peak_rho, 1.001);
         let lo = min(vis.min_rho, 0.999);
         let t  = clamp((rho - lo) / (hi - lo), 0.0, 1.0);
-        let g  = linear_to_srgb(t);
-        return vec4<f32>(g, g, g, 1.0);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let r = clamp( 0.0002 + 1.4383*t  - 1.2307*t2 + 0.8295*t3, 0.0, 1.0);
+        let g = clamp(-0.0143 + 0.5150*t  - 0.4319*t2 + 0.0273*t3, 0.0, 1.0);
+        let b = clamp( 0.0150 + 1.9673*t  - 5.2545*t2 + 4.3476*t3, 0.0, 1.0);
+        return vec4<f32>(
+            linear_to_srgb(r),
+            linear_to_srgb(g),
+            linear_to_srgb(b),
+            1.0,
+        );
     }
 
     // Lightness: density mapped to [0.25, 0.90].
@@ -208,6 +218,7 @@ struct AppState {
     dist_data: Vec<f32>,          // last readback of 9 distribution values per cell
     obstacle_data: Vec<[f32; 4]>, // last readback of obstacle texture [mask, vel_x, vel_y, open_boundary]
     max_speed: f32,             // maximum fluid speed observed in the last readback
+    peak_speed: f32,            // slow-tracking speed ceiling used for histogram range
     min_rho: f32,               // running minimum density (slow-tracking)
     viz_mode_ui: u32,           // 0 = Oklch, 1 = density greyscale
 
@@ -599,6 +610,7 @@ async fn init_gpu(window: Arc<Window>) -> AppState {
         dist_data: vec![0.0f32; (GRID_W * GRID_H * 9) as usize],
         obstacle_data: vec![[0.0; 4]; (GRID_W * GRID_H) as usize],
         max_speed: 0.0,
+        peak_speed: 1e-4,
         min_rho: 1.0,
         viz_mode_ui: 0,
         window,
@@ -633,6 +645,31 @@ fn make_vis_bind_group(
 }
 
 // ── Per-frame update + render ─────────────────────────────────────────────────
+
+fn draw_histogram(ui: &mut egui::Ui, bins: &[u32], max_count: u32, color: egui::Color32) {
+    let n = bins.len();
+    let height = 48.0;
+    let width = ui.available_width();
+    let (response, painter) = ui.allocate_painter(
+        egui::Vec2::new(width, height),
+        egui::Sense::hover(),
+    );
+    let rect = response.rect;
+    let bin_w = rect.width() / n as f32;
+    for (i, &count) in bins.iter().enumerate() {
+        let frac = count as f32 / max_count as f32;
+        let bar_h = frac * rect.height();
+        let x0 = rect.left() + i as f32 * bin_w;
+        let x1 = (x0 + bin_w - 1.0).min(rect.right());
+        let y0 = rect.bottom() - bar_h;
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, rect.bottom())),
+            0.0,
+            color,
+        );
+    }
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Outside);
+}
 
 fn update_and_render(state: &mut AppState) {
     // ── Apply config changes from UI ──────────────────────────────────────
@@ -775,10 +812,33 @@ fn update_and_render(state: &mut AppState) {
     let mut do_reset = false;
     let mut do_step = false;
 
+    // ── Pre-compute histograms from last macroscopic readback ─────────────
+    const HIST_BINS: usize = 32;
+    let mut rho_hist = [0u32; HIST_BINS];
+    let mut speed_hist = [0u32; HIST_BINS];
+    let rho_lo = state.min_rho;
+    let rho_hi = (state.peak_rho).max(rho_lo + 1e-4);
+    let speed_hi = state.peak_speed.max(1e-6);
+    for cell in 0..(GRID_W * GRID_H) as usize {
+        let rho = state.macroscopic_data[cell * 3];
+        let ux  = state.macroscopic_data[cell * 3 + 1];
+        let uy  = state.macroscopic_data[cell * 3 + 2];
+        let b = (((rho - rho_lo) / (rho_hi - rho_lo)) * HIST_BINS as f32)
+            .clamp(0.0, (HIST_BINS - 1) as f32) as usize;
+        rho_hist[b] += 1;
+        let speed = (ux * ux + uy * uy).sqrt();
+        let b = ((speed / speed_hi) * HIST_BINS as f32)
+            .clamp(0.0, (HIST_BINS - 1) as f32) as usize;
+        speed_hist[b] += 1;
+    }
+    let rho_hist_max = rho_hist.iter().copied().max().unwrap_or(1).max(1);
+    let speed_hist_max = speed_hist.iter().copied().max().unwrap_or(1).max(1);
+
     let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
         egui::Panel::right("controls")
             .exact_size(200.0)
             .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("LBM Visualizer");
                 ui.separator();
 
@@ -841,11 +901,10 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.separator();
                 ui.label(format!("Step : {step_count_ref}"));
-                ui.label(format!(
-                    "ρ range : [{:.4}, {:.4}]",
-                    state.min_rho, peak_rho_ref
-                ));
-                ui.label(format!("Max speed : {max_speed_ref:.5}"));
+                ui.label(format!("ρ  [{:.4} … {:.4}]", state.min_rho, peak_rho_ref));
+                draw_histogram(ui, &rho_hist, rho_hist_max, egui::Color32::from_rgb(100, 160, 220));
+                ui.label(format!("Speed  [0 … {:.5}]  cur {max_speed_ref:.5}", state.peak_speed));
+                draw_histogram(ui, &speed_hist, speed_hist_max, egui::Color32::from_rgb(200, 140, 60));
                 ui.label(format!("Non-ambient cells : {nonambient_ref}"));
                 ui.label(format!("Grid : {}×{}", GRID_W, GRID_H));
                 ui.label(format!("τ (active) : {sim_tau_ref:.3}"));
@@ -860,10 +919,9 @@ fn update_and_render(state: &mut AppState) {
                     let ux = state.macroscopic_data[cell_idx * 3 + 1];
                     let uy = state.macroscopic_data[cell_idx * 3 + 2];
                     let obs = state.obstacle_data.get(cell_idx).copied().unwrap_or([0.0; 4]);
-                    let is_solid = obs[0] > 0.5;
                     ui.label(format!("  ({}, {})", gx, gy));
-                    ui.label(format!("  solid : {}", if is_solid { "yes" } else { "no" }));
-                    if is_solid {
+                    ui.label(format!("  fill : {:.4}", obs[0]));
+                    if obs[0] > 0.0 {
                         ui.label(format!("  obs vel : ({:.4}, {:.4})", obs[1], obs[2]));
                     }
                     ui.label(format!("  ρ : {:.4}", rho));
@@ -906,7 +964,8 @@ fn update_and_render(state: &mut AppState) {
 
                 ui.separator();
                 ui.label("Left-click on field to inject");
-            });
+            }); // ScrollArea
+            }); // show_inside
     });
 
     // Apply deferred actions.
@@ -937,6 +996,7 @@ fn update_and_render(state: &mut AppState) {
         state.peak_rho = 1.0;
         state.nonambient = 0;
         state.max_speed = 0.0;
+        state.peak_speed = 1e-4;
         state.block_phase = 0.0;
     }
 
@@ -1116,6 +1176,12 @@ fn do_readback(state: &mut AppState, sim_stepped: bool) {
         }
         state.nonambient = na;
         state.max_speed = max_speed;
+        if max_speed > state.peak_speed {
+            state.peak_speed = max_speed;
+        } else if sim_stepped {
+            const DECAY: f32 = 0.02;
+            state.peak_speed += DECAY * (max_speed - state.peak_speed);
+        }
         state.macroscopic_data = data;
     }
 
